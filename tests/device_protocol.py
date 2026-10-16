@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Adversarial integration tests against the installed Pad app; no desktop is sent.
 
-Requires the receiver in USB waiting mode and Python's cryptography package.
+Requires the Pad app in the foreground, idle, and Python's cryptography package.
 Every test forward is removed in finally. Pairing material is never printed.
 """
 import hashlib
@@ -36,7 +36,7 @@ def raw_read(sock):
     return exact(sock, length)
 
 class Client:
-    def __init__(self, sock, key):
+    def __init__(self, sock, key, expected="hello"):
         self.sock = sock
         nonce = os.urandom(32)
         raw_send(sock, b"PDB1" + nonce)
@@ -49,7 +49,8 @@ class Client:
         self.tx = AESGCM(hmac.digest(prk, CONTEXT + b"mac-to-pad\x01", "sha256"))
         self.rx = AESGCM(hmac.digest(prk, CONTEXT + b"pad-to-mac\x01", "sha256"))
         self.sent = self.received = 0
-        assert self.read()["type"] == "hello"
+        self.hello = self.read()
+        assert self.hello["type"] == expected, self.hello
 
     def packet(self, value):
         aad = struct.pack(">Q", self.sent)
@@ -115,7 +116,7 @@ def main():
             assert c.read()["type"] == "ready"
             c.send({"type": "touch", "x": 0.5, "y": 0.5}); c.rejected()
         print("PASS input injection message rejected")
-        for color, codec, depth in [("unknown-hdr", "hevc", 10), ("bt2020-limited-hlg10", "h264", 10), ("bt2020-limited-hlg10", "hevc", 8), ("bt709-limited-sdr", "hevc", 10)]:
+        for color, codec, depth in [("unknown-hdr", "hevc", 10), ("bt2020-limited-hlg10", "h264", 10), ("bt2020-limited-hlg10", "hevc", 8), ("bt709-limited-sdr", "hevc", 10), ("bt709-limited-sdr", "unknown", 8)]:
             with connect() as s:
                 c = Client(s, key); c.send(probe); c.read()
                 c.send(dict(probe, type="config", codec=codec, color=color, bitDepth=depth, input=False))

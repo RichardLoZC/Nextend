@@ -5,6 +5,7 @@ import CoreVideo
 
 struct SessionOptions {
     var profile = Profile()
+    var codecPreference = CodecPreference.auto
     var wireless = false
     var host = ""
     var interface = "en0"
@@ -24,9 +25,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     private var options: SessionOptions
     private let queue = DispatchQueue(label: "PadBridge.pipeline", qos: .userInteractive)
     private let sender = DispatchQueue(label: "PadBridge.writer", qos: .userInteractive)
-    // Four credits cover a ~50 ms decode round trip at 60 Hz without a
-    // periodic skipped source frame. This remains a hard end-to-end bound.
-    private let maxInFlight = 4
+    private var maxInFlight: Int { options.profile.frameCredits }
     private let stateLock = NSLock()
     private var stopping = false
     private var fallbackCancelled = false
@@ -54,6 +53,9 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     private var pending: [UInt64: UInt64] = [:]
     private var forceKeyframe = true
     private var captured: UInt64 = 0
+    private var sourceFrames: UInt64 = 0
+    private var lastTickSource: UInt64 = 0
+    private var encoderRecovery = EncoderRecovery()
     private var encoded: UInt64 = 0
     private var rendered: UInt64 = 0
     private var skipped: UInt64 = 0
@@ -80,6 +82,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     enum StatusKind { case information, preparing, connected, hdrVerified, metrics }
     var onStatus: ((AppMessage, StatusKind) -> Void)?
     var onMetrics: (([String: Any]) -> Void)?
+    var onPeerAddress: ((String) -> Void)?
     var onFinish: ((Bool) -> Void)?
     var onFallback: ((AppMessage, VirtualDisplay?) -> Void)?
     init(options: SessionOptions, retainedDisplay: VirtualDisplay? = nil) {
@@ -124,27 +127,29 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
             guard !isStopping else { channel.close(); return }
             let hello = try await Task.detached { try Self.json(channel.receive()) }.value
             guard !isStopping else { return }
+            if hello["type"] as? String == "busy" { throw BridgeError("Pad 已连接其他会话，请先在 Mac 断开。") }
             guard hello["type"] as? String == "hello", hello["version"] as? Int == 1,
                   hello["input"] as? Bool == false else { throw BridgeError("Pad 协议版本不匹配。") }
+            if !options.wireless, let address = hello["wifiAddress"] as? String, Self.validPeerAddress(address) {
+                onPeerAddress?(address)
+            }
             let requested = options.profile
             let capabilities = try await Task.detached {
                 try channel.sendJSON(["type": "probe", "version": 1, "width": requested.width, "height": requested.height, "fps": requested.fps])
                 return try Self.json(channel.receive())
             }.value
             guard !isStopping else { return }
-            guard let codecs = capabilities["codecs"] as? [String] else { throw BridgeError("Pad 能力协商失败。") }
+            guard capabilities["type"] as? String == "capabilities", let codecs = capabilities["codecs"] as? [String] else { throw BridgeError("Pad 能力协商失败。") }
             if options.profile.color == .hlg {
                 let colors = capabilities["colors"] as? [String] ?? []
-                if !colors.contains(VideoColor.hlg.rawValue) || !VirtualDisplay.supportsHDR {
+                if !colors.contains(VideoColor.hlg.rawValue) || !codecs.contains("hevc") || !VirtualDisplay.supportsHDR {
                     try selectSDR("Mac 或 Pad 不支持当前配置的 HLG / Main10")
                 }
                 if #unavailable(macOS 15.0) { try selectSDR("HDR 采集需要 macOS 15 或更新版本") }
             }
-            if !codecs.contains(options.profile.codec) {
-                guard codecs.contains("h264") else { throw BridgeError("Pad 硬件不支持所选分辨率和帧率，请降低刷新率或分辨率。") }
-                if options.profile.color == .hlg { try selectSDR("Pad 未提供 HEVC 编码能力") }
-                options.profile.codec = "h264"; status("Pad 不支持 HEVC，已切换 H.264。")
-            }
+            guard let codec = options.codecPreference.select(supported: codecs, color: options.profile.color)
+            else { throw BridgeError("Pad 硬件不支持所选分辨率和帧率，请降低刷新率或分辨率。") }
+            options.profile.codec = codec
             if options.profile.color == .hlg {
                 do { encoder = try makeEncoder() }
                 catch {
@@ -204,7 +209,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
                 config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(p.fps * 2))
                 // Capture surfaces also remain held by VideoToolbox. Give the
                 // pool headroom independently of the end-to-end credit limit.
-                config.queueDepth = 6
+                config.queueDepth = maxInFlight + 2
                 config.showsCursor = true; config.capturesAudio = false
                 let capture = SCStream(filter: SCContentFilter(display: screen, excludingWindows: []), configuration: config, delegate: self)
                 try capture.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
@@ -226,7 +231,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
             guard !isStopping else { return }
             queue.sync {
                 startedNS = monotonicNS(); lastTickNS = startedNS
-                lastTickEncoded = encoded; ready = true
+                lastTickEncoded = encoded; lastTickSource = sourceFrames; ready = true
             }
             try queue.sync { try startTimers() }
             status("\(p.width) × \(p.height) · \(p.fps) fps 目标 · \(p.codec.uppercased()) · \(p.color.title)", kind: .connected)
@@ -249,10 +254,16 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     }
     private func makeSDREncoder(codecs: [String]) throws -> VideoEncoder {
         do { return try makeEncoder() }
-        catch where options.profile.codec == "hevc" && codecs.contains("h264") {
-            options.profile.codec = "h264"; status("Mac HEVC 初始化失败，已切换 H.264。")
+        catch where codecs.contains(options.profile.codec == "hevc" ? "h264" : "hevc") {
+            options.profile.codec = options.profile.codec == "hevc" ? "h264" : "hevc"
+            status("编码器初始化失败，已切换为 \(options.profile.codec.uppercased())。")
             return try makeEncoder()
         }
+    }
+    private static func validPeerAddress(_ address: String) -> Bool {
+        let parts = address.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4, parts.allSatisfy({ UInt8($0) != nil }), let first = UInt8(parts[0]) else { return false }
+        return first > 0 && first < 224 && first != 127 && !(first == 169 && UInt8(parts[1]) == 254)
     }
     @MainActor private func prepareHDRCapture(displayID: CGDirectDisplayID, profile: Profile) throws {
         // SCK's canonical preset on macOS 27 emits P3/PQ 4:4:4, and overrides
@@ -269,6 +280,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
                 if state == .stopped { lifetime.didStop(); return }
                 guard let self else { return }
                 guard self.active, state == .frameComplete, let surface else { return }
+                self.sourceFrames += 1
                 guard self.pending.count < self.maxInFlight else { self.skipped += 1; return }
                 let started = monotonicNS()
                 autoreleasepool {
@@ -345,7 +357,9 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
             let timer = DispatchSource.makeTimerSource(queue: queue)
             timer.schedule(deadline: .now(), repeating: .nanoseconds(1_000_000_000 / options.profile.fps), leeway: .microseconds(100))
             timer.setEventHandler { [weak self] in
-                guard let self, self.active, self.pending.count < self.maxInFlight else { return }
+                guard let self, self.active else { return }
+                self.sourceFrames += 1
+                guard self.pending.count < self.maxInFlight else { self.skipped += 1; return }
                 do { self.submit(try source.frame(self.nextSequence), capturedNS: monotonicNS()) }
                 catch { self.stop(reason: error.appMessage, success: false) }
             }
@@ -357,6 +371,8 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
               let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               let raw = attachments.first?[.status] as? Int, SCFrameStatus(rawValue: raw) == .complete,
               let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        guard active else { return }
+        sourceFrames += 1
         submit(buffer, capturedNS: monotonicNS())
     }
     func stream(_ stream: SCStream, didStopWithError error: Error) { stop(reason: "屏幕采集停止：\(error.appMessage)", success: false) }
@@ -380,12 +396,15 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         do { try encoder?.encode(buffer, sequence: nextSequence, capturedNS: capturedNS, forceKeyframe: force) }
         catch { if options.profile.color == .hlg { failHDR(error.appMessage) } else { stop(reason: error.appMessage, success: false) } }
     }
-    private func didEncode(_ result: Result<EncodedFrame, Error>) {
+    private func didEncode(_ result: Result<EncoderOutput, Error>) {
         guard active else { return }
         switch result {
         case .failure(let error):
             if options.profile.color == .hlg { failHDR(error.appMessage) } else { stop(reason: error.appMessage, success: false) }
-        case .success(let frame):
+        case .success(.dropped(let sequence)):
+            pending.removeValue(forKey: sequence); encoderRecovery.didDrop(at: monotonicNS()); forceKeyframe = true
+        case .success(.frame(let frame)):
+            encoderRecovery.didEncode()
             encoded += 1; bytes += UInt64(frame.bytes.count)
             if encodedColor.isEmpty { encodedColor = frame.colorInfo; log("编码格式：\(encodedColor)") }
             encodeSamples.append(Double(frame.encodedNS - frame.capturedNS) / 1e6)
@@ -441,12 +460,22 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     private func sample() {
         guard active else { return }
         let now = monotonicNS(); let elapsed = Double(now - startedNS) / 1e9
+        // A static desktop may never emit a replacement for a dropped frame.
+        // End a stalled session even after a single drop, rather than report a
+        // connected black/stale picture forever. A successful output resets it.
+        if encoderRecovery.stalled(at: now) {
+            let reason: AppMessage = "硬件编码器丢帧后未恢复，请降低帧率或分辨率。"
+            if options.profile.color == .hlg { failHDR(reason) } else { stop(reason: reason, success: false) }
+            return
+        }
         if pending.values.contains(where: { now - $0 > 3_000_000_000 }) {
             if options.profile.color == .hlg && !verifiedHDR { failHDR("HDR 解码未在 3 秒内确认首帧"); return }
             stop(reason: "视频链路超时，已释放虚拟屏。可重新连接。", success: false); return
         }
         var row = remote
         row["seconds"] = elapsed; row["encodeFps"] = Double(encoded - lastTickEncoded) * 1e9 / Double(now - lastTickNS)
+        row["sourceFps"] = Double(sourceFrames - lastTickSource) * 1e9 / Double(now - lastTickNS)
+        row["sourceFrames"] = sourceFrames; row["encoderDropped"] = encoderRecovery.dropped; row["maxInFlight"] = maxInFlight
         row["pending"] = pending.count; row["captured"] = captured; row["encoded"] = encoded; row["skippedBeforeEncodeOrDecoder"] = skipped
         row["captureToDecodeAckP50Ms"] = percentile(pathSamples, 0.5); row["captureToDecodeAckP95Ms"] = percentile(pathSamples, 0.95)
         row["encodeP50Ms"] = percentile(encodeSamples, 0.5); row["megabitsPerSecond"] = Double(bytes) * 8 / elapsed / 1e6
@@ -456,7 +485,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         rows.append(row); if rows.count > 7200 { rows.removeFirst(600) }
         let metrics = row
         DispatchQueue.main.async { [weak self] in self?.onMetrics?(metrics) }
-        lastTickNS = now; lastTickEncoded = encoded
+        lastTickNS = now; lastTickEncoded = encoded; lastTickSource = sourceFrames
         log(String(format: "编码 %.1f fps · Pad 呈现回调 %.1f fps · 解码往返 P95 %.1f ms · 队列 %d/%d", row["encodeFps"] as? Double ?? 0, remote["renderFps"] as? Double ?? 0, percentile(pathSamples, 0.95), pending.count, maxInFlight))
         if options.profile.color == .hlg && !verifiedHDR && elapsed > 8 { failHDR("8 秒内未收到 Pad HDR 输出确认"); return }
         if options.seconds > 0 && elapsed >= options.seconds {

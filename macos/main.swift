@@ -11,7 +11,7 @@ if CommandLine.arguments.contains("--self-test") {
 if CommandLine.arguments.contains("--help") {
     print("""
     Nextend: --probe-display | --self-test | --benchmark | --capture-test | --connect
-      --fps 60|90|120 --width 3200 --height 2136 --codec hevc|h264
+      --fps 60|90|120 --width 3200 --height 2136 --codec auto|hevc|h264 (default: auto)
       --bitrate 45 (Mbps) --seconds 30 --report /absolute/report.json
       --host PAD_IPV4 --interface en0 (wireless; pair through USB first)
       --hdr (request HLG10 with SDR fallback) | --require-hdr (fail instead of fallback)
@@ -48,7 +48,29 @@ func runSelfTests() throws {
     for fps in [60, 90, 120] { var p = Profile(); p.fps = fps; try p.validate() }
     var hdrProfile = Profile(); hdrProfile.color = .hlg; try hdrProfile.validate()
     hdrProfile.codec = "h264"
-    do { try hdrProfile.validate(); throw BridgeError("HDR/H264 accepted") } catch let e as BridgeError { try check(e.message.hasPrefix("无效画面配置"), "HDR requires HEVC") }
+    do { try hdrProfile.validate(); throw BridgeError("HDR/H264 accepted") } catch let e as BridgeError { try check(e.message == "HDR 需要 HEVC Main10；H.264 仅支持 SDR。", "HDR requires HEVC") }
+    try check(CodecPreference.auto.select(supported: ["h264", "hevc"], color: .sdr) == "hevc", "automatic HEVC priority")
+    try check(CodecPreference.auto.select(supported: ["h264"], color: .sdr) == "h264", "legacy SDR fallback")
+    try check(CodecPreference.auto.select(supported: ["h264"], color: .hlg) == nil, "no HDR mislabeling")
+    try check(CodecPreference.h264.select(supported: ["hevc"], color: .sdr) == "hevc", "unsupported diagnostic preference falls back")
+    try check(CodecPreference.auto.select(supported: ["av1"], color: .sdr) == nil, "unknown codecs rejected")
+    try check(CodecPreference.h264.select(supported: ["hevc", "h264"], color: .hlg) == "hevc", "HDR always Main10")
+    for fps in [60, 90, 120] {
+        let native = Profile(fps: fps)
+        let lower = Profile(width: 2400, height: 1600, fps: fps)
+        try check(native.frameCredits == 4, "native resolution preserves latency bound")
+        try check(lower.frameCredits <= 6 && lower.frameCredits == (fps == 60 ? 4 : 6), "high-refresh credits respect receiver capacity")
+    }
+    var recovery = EncoderRecovery()
+    try check(!recovery.stalled(at: 9_000_000_000), "static desktop without drops stays connected")
+    recovery.didDrop(at: 10_000_000_000)
+    try check(!recovery.stalled(at: 12_000_000_000), "transient frame drop has a recovery window")
+    recovery.didDrop(at: 12_000_000_000)
+    try check(recovery.stalled(at: 13_000_000_001), "new drops do not extend the deadline")
+    recovery.didEncode()
+    try check(!recovery.stalled(at: 20_000_000_000) && recovery.dropped == 2, "successful output clears the stall but keeps diagnostics")
+    recovery.didDrop(at: 20_000_000_000)
+    try check(recovery.stalled(at: 23_000_000_001), "single dropped static frame cannot hang forever")
     try HDRConverter.selfTest()
     try check(AppMessage.translations.count > 100, "bundled English message catalog")
     let nested: AppMessage = "已回退 SDR：\(AppMessage(stringLiteral: "Pad 未就绪。"))"

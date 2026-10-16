@@ -18,6 +18,9 @@ class Receiver(
     private val address: String, private val key: ByteArray, private val surface: Surface,
     private val panelWidth: Int, private val panelHeight: Int,
     private val hdrTypes: IntArray,
+    private val lease: SessionLease,
+    private val wifiAddress: () -> String?,
+    private val listening: (Boolean) -> Unit,
     private val status: (UiText, Boolean) -> Unit,
     private val stats: (RenderStats) -> Unit,
     private val mode: (Int) -> Unit, private val refresh: () -> Float,
@@ -29,26 +32,50 @@ class Receiver(
     private val lifecycleLock = Any()
     private val worker = Thread({ listen() }, "PadBridge-receiver")
     fun start() { worker.start() }
-    private fun waiting() = if (address == "127.0.0.1") UiText("用 USB 连接 Mac，在 Mac 上点击连接。", "Connect the Mac with USB, then click Connect on the Mac.") else UiText("无线地址 $address · 首次连接需先通过 USB 配对。", "Wi-Fi address $address · Pair through USB before the first wireless connection.")
     private fun listen() {
         try {
             val listener = ServerSocket().also { server = it }
             listener.reuseAddress = true
             listener.bind(java.net.InetSocketAddress(InetAddress.getByName(address), PORT), 1)
             listener.soTimeout = 1000
-            status(waiting(), false)
+            listening(true)
             while (running) {
                 val client = try { listener.accept() } catch (_: SocketTimeoutException) { continue }
                 synchronized(lifecycleLock) { if (running) socket = client else client.close() }
                 if (!running) { client.close(); break }
-                try { client.use { val secure = SecureChannel(it, key); if (running) serve(secure) }; if (running) status(waiting(), false) }
-                catch (e: Exception) { if (running) status(UiText("连接结束：${e.message}\n等待 Mac 重新连接", "Connection ended: ${e.message}\nWaiting for the Mac to reconnect"), false) }
-                finally { synchronized(lifecycleLock) { if (socket === client) socket = null } }
+                var ownsSession = false
+                var releaseDelegated = false
+                var ended = UiText("连接已结束", "Disconnected")
+                try {
+                    client.use {
+                        // Never let an unauthenticated socket acquire the shared Surface.
+                        val secure = SecureChannel(it, key)
+                        if (!running) return@use
+                        ownsSession = lease.acquire(client)
+                        if (!ownsSession) {
+                            secure.send(byteArrayOf(1) + JSONObject().put("type", "busy").toString().toByteArray())
+                            return@use
+                        }
+                        if (running) {
+                            releaseDelegated = true
+                            serve(secure) { lease.release(client) }
+                        }
+                    }
+                } catch (e: Exception) {
+                    ended = UiText("连接结束：${e.message}", "Connection ended: ${e.message}")
+                } finally {
+                    // serve() closes its decoder before another transport can enter.
+                    if (ownsSession) {
+                        if (!releaseDelegated) lease.release(client)
+                        if (running) status(ended, false)
+                    }
+                    synchronized(lifecycleLock) { if (socket === client) socket = null }
+                }
             }
-        } catch (e: Exception) { if (running) status(UiText("监听失败：${e.message}", "Could not listen: ${e.message}"), false) }
-        finally { runCatching { server?.close() } }
+        } catch (e: Exception) { if (running) android.util.Log.w("PadBridge", "Listener unavailable", e) }
+        finally { runCatching { server?.close() }; if (running) listening(false) }
     }
-    private fun serve(channel: SecureChannel) {
+    private fun serve(channel: SecureChannel, releaseSession: () -> Unit) {
         var decoder: VideoDecoder? = null
         val scheduler = Executors.newSingleThreadScheduledExecutor()
         val rendered = AtomicLong(0); val decoded = AtomicLong(0); val dropped = AtomicLong(0); val totalReceived = AtomicLong(0)
@@ -59,7 +86,8 @@ class Receiver(
         fun send(value: JSONObject) { channel.send(byteArrayOf(1) + value.toString().toByteArray()) }
         try {
             send(JSONObject().put("type", "hello").put("version", 1).put("width", panelWidth).put("height", panelHeight)
-                .put("input", false).put("refresh", refresh()).put("hdrTypes", JSONArray(hdrTypes.toList())))
+                .put("input", false).put("refresh", refresh()).put("hdrTypes", JSONArray(hdrTypes.toList()))
+                .put("wifiAddress", wifiAddress()))
             val initial = channel.receive()
             require(initial.firstOrNull() == 1.toByte())
             require(initial.size <= 65536)
@@ -82,6 +110,7 @@ class Receiver(
             require(config.getString("type") == "config" && config.getInt("version") == 1)
             require(config.getInt("width") == width && config.getInt("height") == height && config.getInt("fps") == fps)
             val encoding = config.getString("codec")
+            require((0 until codecs.length()).any { codecs.getString(it) == encoding }) { "Codec not advertised for this configuration" }
             color = VideoColor.negotiate(config.getString("color"), encoding, hlgSupported)
             require(config.optInt("bitDepth", 8) == color.bitDepth)
             require(!config.optBoolean("input", false))
@@ -146,8 +175,11 @@ class Receiver(
             runCatching { send(JSONObject().put("type", if (color == VideoColor.HLG) "hdr-error" else "error").put("message", e.message ?: "Receive failed")) }
             throw e
         } finally {
-            channel.close(); scheduler.shutdownNow(); decoder?.close()
+            channel.close(); scheduler.shutdownNow()
             runCatching { surface.setFrameRate(0f, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT) }
+            // If vendor teardown exceeds our UI wait, retain the lease until
+            // the codec handler actually releases the old decoder.
+            decoder?.closeWhenReleased(releaseSession) ?: releaseSession()
         }
     }
     override fun close() {

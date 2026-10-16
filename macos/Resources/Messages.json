@@ -116,5 +116,10 @@
   "发送帧超出大小限制。": "The outgoing frame exceeds the size limit.",
   "发送超时或 USB 已断开。": "The send timed out or USB was disconnected.",
   "会话序号耗尽，请重新连接。": "Session sequence numbers exhausted. Reconnect.",
-  "会话序号耗尽。": "Session sequence numbers exhausted."
+  "会话序号耗尽。": "Session sequence numbers exhausted.",
+  "HDR 需要 HEVC Main10；H.264 仅支持 SDR。": "HDR requires HEVC Main10; H.264 supports SDR only.",
+  "编码参数需要 auto、hevc 或 h264。": "Codec must be auto, hevc or h264.",
+  "Pad 已连接其他会话，请先在 Mac 断开。": "The Pad is already connected. Disconnect the current session on the Mac first.",
+  "编码器初始化失败，已切换为 {0}。": "Encoder initialization failed; switched to {0}.",
+  "硬件编码器丢帧后未恢复，请降低帧率或分辨率。": "The hardware encoder did not recover after dropping a frame. Lower the frame rate or resolution."
 }

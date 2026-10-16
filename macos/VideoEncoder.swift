@@ -12,11 +12,17 @@ struct EncodedFrame {
     let colorInfo: [String: Any]
 }
 
+enum EncoderOutput {
+    case frame(EncodedFrame)
+    case dropped(UInt64)
+}
+
 final class VideoEncoder {
     private var session: VTCompressionSession?
     private let profile: Profile
-    private let output: (Result<EncodedFrame, Error>) -> Void
-    init(profile: Profile, output: @escaping (Result<EncodedFrame, Error>) -> Void) throws {
+    private let output: (Result<EncoderOutput, Error>) -> Void
+    init(profile: Profile, output: @escaping (Result<EncoderOutput, Error>) -> Void) throws {
+        try profile.validate()
         self.profile = profile; self.output = output
         var spec = [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true,
                     kVTVideoEncoderSpecification_EnableLowLatencyRateControl: true] as CFDictionary
@@ -69,13 +75,17 @@ final class VideoEncoder {
         let status = VTCompressionSessionEncodeFrame(session, imageBuffer: buffer,
             presentationTimeStamp: CMTime(value: Int64(sequence), timescale: CMTimeScale(profile.fps)),
             duration: CMTime(value: 1, timescale: CMTimeScale(profile.fps)), frameProperties: properties, infoFlagsOut: nil) { status, flags, sample in
-                guard status == noErr, !flags.contains(.frameDropped), let sample else {
+                guard status == noErr else {
                     callback(.failure(BridgeError("编码帧失败或被硬件丢弃：\(status)"))); return
                 }
+                // A real-time encoder may skip input under load. No encoded
+                // reference frame was discarded; return its sender credit.
+                if flags.contains(.frameDropped) { callback(.success(.dropped(sequence))); return }
+                guard let sample else { callback(.failure(BridgeError("编码输出缺少格式。"))); return }
                 do {
                     let key = !(((CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[CFString: Any]])?.first?[kCMSampleAttachmentKey_NotSync]) as? Bool ?? false)
                     let colorInfo = try Self.colorInfo(sample, requireHDR: hdr)
-                    callback(.success(EncodedFrame(sequence: sequence, capturedNS: capturedNS, encodedNS: monotonicNS(), keyframe: key, bytes: try Self.annexB(sample, keyframe: key), colorInfo: colorInfo)))
+                    callback(.success(.frame(EncodedFrame(sequence: sequence, capturedNS: capturedNS, encodedNS: monotonicNS(), keyframe: key, bytes: try Self.annexB(sample, keyframe: key), colorInfo: colorInfo))))
                 } catch { callback(.failure(error)) }
             }
         guard status == noErr else { throw BridgeError("提交硬件编码失败：\(status)") }

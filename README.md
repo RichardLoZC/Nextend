@@ -9,6 +9,8 @@ Nextend is a native macOS and Android app with a liquid glass interface. It crea
 ## Features
 
 - A real extended desktop with 2× HiDPI, not screen mirroring.
+- Automatic hardware codec selection: HEVC preferred, H.264 compatibility fallback; HDR uses HEVC Main10.
+- Choose USB or encrypted Wi-Fi on the Mac; the tablet listens for both and allows only one active session.
 - Hardware HEVC / H.264, 3200 × 2136 or 2400 × 1600, and 60 / 90 / 120 fps targets.
 - SDR and optional HLG 10-bit HDR, with verified output and SDR fallback.
 - Encrypted USB through ADB; encrypted Wi-Fi after USB pairing.
@@ -17,7 +19,7 @@ Nextend is a native macOS and Android app with a liquid glass interface. It crea
 - Optional FPS overlay based on actual MediaCodec rendered-frame callbacks. Drag it anywhere; choose color, font and size. Preferences survive restarts.
 - Chinese and English, switchable on each device without reconnecting.
 
-The current release is **0.4.0**. Nextend was previously called PadBridge; internal app identifiers and pairing storage retain that name so upgrades preserve pairing.
+The current release is **0.5.0**. Nextend was previously called PadBridge; internal app identifiers and pairing storage retain that name so upgrades preserve pairing.
 
 ## Requirements and limits
 
@@ -38,15 +40,15 @@ Download the matching Mac ZIP and Android APK from [Releases](https://github.com
 
 1. Install and open Nextend on the tablet; authorize USB debugging.
 2. Move `Nextend.app` into `/Applications` or `~/Applications`, then open it. Use **Screen recording** to grant permission in System Settings, then reopen the app if prompted.
-3. Select **USB** on both devices and click **Connect** on the Mac. Use **Arrange displays** to position the new desktop.
-4. After USB pairing, select **Encrypted Wi-Fi** on the tablet. Enter its displayed IPv4 address on the Mac, select the correct interface (usually `en0`), and connect. After changing networks, select Wi-Fi again on the tablet to bind its new address.
+3. Select **USB** and click **Connect** on the Mac. No mode selection is needed on the tablet. Use **Arrange displays** to position the new desktop.
+4. After USB pairing, disconnect and select **Encrypted Wi-Fi** on the Mac. The Mac remembers the Wi-Fi address from the authenticated USB handshake; you can also enter the address shown on the tablet. Select the correct interface (usually `en0`) and connect. The tablet automatically updates its listener after network changes. Reconnect over USB to refresh the Mac’s saved address, or enter the new one manually. Switching transport requires no tablet controls.
 5. To use HDR, disconnect first, enable HDR on the Mac, then reconnect. **HDR · HLG 10-bit** confirms the output format; an unavailable HDR path falls back to SDR with a reason.
 
-The Mac language selector is in the top-right corner and menu bar. The tablet language selector and FPS settings are in its control menu. Tap the video or FPS overlay to show or hide that menu. Dragging the FPS overlay only moves it; it does not send input to the Mac.
+The top-right Mac button switches language directly; the menu bar has the same action. The tablet language selector and FPS settings are in its control menu. Tap the video or FPS overlay to show or hide that menu. Dragging the FPS overlay only moves it; it does not send input to the Mac.
 
 Closing the Mac window keeps streaming. **Disconnect** stops the session; **Quit Nextend** also exits the app and releases the virtual display. macOS moves its windows back to the remaining displays.
 
-If a rebuilt Mac app reports missing screen-recording permission despite an enabled switch, remove the old Nextend entry in System Settings, add the current app, and reopen it. Ad-hoc signing binds authorization to each build; a stable developer signature would be needed for production distribution. Wi-Fi also requires local-network permission.
+If a rebuilt Mac app reports missing screen-recording permission despite an enabled switch, remove the old Nextend entry in System Settings, add the current app, and reopen it. Ad-hoc signing binds authorization to each build; a stable developer signature would be needed for production distribution. Wi-Fi also requires local-network permission. If that permission appears enabled but wireless access fails after an update, toggle the existing Nextend local-network switch off and on, then retry.
 
 ## Build
 
@@ -72,9 +74,11 @@ The Android build pins Gradle 8.13, Android Gradle Plugin 8.11.1 and Kotlin 2.2.
 python3 tests/display_lifecycle.py
 python3 tests/hdr_fallback.py
 python3 tests/device_protocol.py
+python3 tests/transport_switch.py
+python3 tests/listener_recovery.py
 ```
 
-Run display and streaming tests one at a time. Lifecycle checks create a temporary virtual display. The fallback test needs an existing local USB pairing key; protocol tests need the tablet waiting in USB mode and Python `cryptography`.
+Run display and streaming tests one at a time. Lifecycle checks create a temporary virtual display. The fallback test needs an existing local USB pairing key; protocol tests need the tablet app open and idle, and Python `cryptography`. Transport-switch and listener-recovery tests also need reachable Wi-Fi. The latter restarts the tablet app and temporarily occupies its wireless port to verify recovery.
 
 ```sh
 outputs/Nextend.app/Contents/MacOS/Nextend --capture-test --require-hdr --seconds 30 --report outputs/hdr.json
@@ -83,7 +87,7 @@ outputs/Nextend.app/Contents/MacOS/Nextend --help
 
 `--capture-test` includes desktop capture. `--benchmark` uses synthetic frames and does not validate screen capture. The FPS overlay measures rendered callbacks, not the panel's refresh rate or optical latency.
 
-See [0.4.0 validation](docs/RELEASE-0.4.md), [0.3.0 HDR measurements](docs/HDR-VALIDATION.md) and [earlier SDR measurements](docs/VALIDATION.md). Short smoke tests do not establish long-term stability. Historical measurements describe their original builds, not every subsequent release.
+See [0.5.0 validation and high-refresh findings](docs/RELEASE-0.5.md), [0.4.0 validation](docs/RELEASE-0.4.md), [0.3.0 HDR measurements](docs/HDR-VALIDATION.md) and [earlier SDR measurements](docs/VALIDATION.md). Short smoke tests do not establish long-term stability. Historical measurements describe their original builds, not every subsequent release.
 
 ## Source and design
 

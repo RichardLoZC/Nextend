@@ -129,13 +129,17 @@ class VideoDecoder(
             } catch (e: Exception) { fail("Could not submit frame: ${e.message}"); return }
         }
     }
-    override fun close() {
+    override fun close() { closeWhenReleased {} }
+    // Called once by the owning receiver worker. The lease callback runs only
+    // after native codec cleanup, even if the bounded wait below expires.
+    fun closeWhenReleased(onReleased: () -> Unit) {
         if (closed) return
         closed = true
         val latch = CountDownLatch(1)
         handler.post {
             runCatching { codec.stop() }; runCatching { codec.release() }
-            pending.clear(); received.clear(); presentationPending.clear(); latch.countDown(); thread.quitSafely()
+            pending.clear(); received.clear(); presentationPending.clear()
+            onReleased(); latch.countDown(); thread.quitSafely()
         }
         // The caller is the receiver worker, never the codec handler.
         latch.await(2, TimeUnit.SECONDS)

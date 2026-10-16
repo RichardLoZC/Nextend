@@ -7,6 +7,9 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.net.Network
+import android.net.NetworkRequest
+import android.net.LinkProperties
 import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.os.PowerManager
@@ -23,15 +26,20 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var fpsOverlay: FpsOverlay
     private lateinit var controlContainer: ScrollView
     private lateinit var connectionInfo: TextView
-    private lateinit var usbButton: Button
-    private lateinit var wifiButton: Button
     private lateinit var idleArt: View
     private lateinit var hideButton: Button
     private lateinit var heading: TextView
-    private var receiver: Receiver? = null
+    private val receivers = mutableMapOf<Boolean, Receiver>()
+    private val receiverTokens = mutableMapOf<Boolean, Any>()
+    private val listening = mutableSetOf<Boolean>()
+    private val listenerRetries = mutableMapOf<Boolean, Int>()
+    private val retryTokens = mutableMapOf<Boolean, Any>()
+    private val sessionLease = SessionLease()
+    private var activeTransport: Boolean? = null
+    @Volatile private var wirelessAddress: String? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var resumed = false
     private var surfaceReady = false
-    private var wireless = false
     private var streaming = false
     private var wifiLock: WifiManager.WifiLock? = null
     private var generation = 0
@@ -57,6 +65,15 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         setContentView(root)
         window.insetsController?.hide(WindowInsets.Type.systemBars())
         window.insetsController?.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            private fun changed() { runOnUiThread { refreshWireless() } }
+            override fun onAvailable(network: Network) = changed()
+            override fun onLost(network: Network) = changed()
+            override fun onLinkPropertiesChanged(network: Network, properties: LinkProperties) = changed()
+        }
+        getSystemService(ConnectivityManager::class.java).registerNetworkCallback(
+            NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build(), callback)
+        networkCallback = callback
     }
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
     private fun text(label: String, size: Float, color: Int = GlassColors.ink, bold: Boolean = false) = TextView(this).apply {
@@ -89,9 +106,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         add(brand)
         heading = text(tr("等待连接", "Ready to connect"), 26f, bold = true); add(heading, top = 18)
         idleArt = BridgeIllustration(this); add(idleArt, 120, 12)
-        usbButton = button(tr("USB 有线", "USB")) { wireless = false; restart() }
-        wifiButton = button(tr("加密无线", "Encrypted Wi-Fi")) { wireless = true; restart() }
-        add(row(usbButton, wifiButton), top = 16)
         connectionInfo = text("", 13f, GlassColors.muted).apply { setPadding(0, dp(12), 0, dp(12)); setTextIsSelectable(true) }
         add(connectionInfo, top = 4)
         val fps = Switch(this).apply {
@@ -105,7 +119,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         add(row(chinese, english), top = 10)
         add(button(tr("重新配对", "Pair again")) {
             AlertDialog.Builder(this).setMessage(tr("断开当前连接并撤销配对？之后需要通过 USB 重新连接 Mac。", "Disconnect and revoke pairing? You will need USB to pair with the Mac again."))
-                .setPositiveButton(tr("重新配对", "Pair again")) { _, _ -> stop(); key = PairCrypto.random(32); File(filesDir, "pairing.key").writeBytes(key); wireless = false; restart() }
+                .setPositiveButton(tr("重新配对", "Pair again")) { _, _ -> stop(); key = PairCrypto.random(32); File(filesDir, "pairing.key").writeBytes(key); restart() }
                 .setNegativeButton(tr("取消", "Cancel"), null).show()
         }, 48, 10)
         hideButton = button(tr("返回桌面", "Back to desktop")) { controlContainer.visibility = View.GONE }; add(hideButton, 48, 10)
@@ -132,13 +146,17 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         view.contentDescription = view.text.toString() + if (selected) tr("，已选择", ", selected") else ""
     }
     private fun updateMenuState() {
-        if (!::usbButton.isInitialized) return
-        styleSelected(usbButton, !wireless); styleSelected(wifiButton, wireless)
-        usbButton.isEnabled = !streaming; wifiButton.isEnabled = !streaming
+        if (!::connectionInfo.isInitialized) return
         heading.text = if (streaming) tr("已连接", "Connected") else tr("等待连接", "Ready to connect")
         idleArt.visibility = if (streaming) View.GONE else View.VISIBLE
         hideButton.visibility = if (streaming) View.VISIBLE else View.GONE
-        var details = connectionText.text
+        var details = if (streaming) {
+            (if (activeTransport == true) tr("加密无线", "Encrypted Wi-Fi") else "USB") + " · " + connectionText.text
+        } else {
+            tr("在 Mac 上选择连接方式。首次使用请通过 USB 配对。", "Choose the connection on your Mac. Pair with USB on first use.") +
+                (if (true in listening && wirelessAddress != null) "\n" + tr("无线地址：", "Wi-Fi: ") + wirelessAddress else "") +
+                (if (false !in listening) "\n" + tr("USB 尚未就绪", "USB is not ready") else "")
+        }
         if (streaming) latestStats?.let {
             details += "\n" + tr("呈现", "Rendered") + String.format(Locale.ROOT, " %.1f fps · ", it.fps) + tr("面板", "Display") + String.format(Locale.ROOT, " %.0f Hz", it.displayHz)
             details += "\n" + tr("解码", "Decoded") + String.format(Locale.ROOT, " %.1f fps · ", it.decodeFps) + tr("丢弃", "Dropped") + " ${it.dropped} · " + tr("温控", "Thermal") + " ${it.thermal}"
@@ -204,28 +222,70 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private fun restart() {
         stop(); updateMenuState()
         if (!resumed || !surfaceReady) return
-        val address = if (wireless) wifiAddress() else "127.0.0.1"
-        if (address == null) {
-            connectionText = UiText("没有可用 Wi-Fi 地址，请连接局域网或使用 USB。", "No Wi-Fi address. Join a local network or use USB.")
-            controlContainer.visibility = View.VISIBLE; updateMenuState(); return
-        }
+        startReceiver(false, "127.0.0.1")
+        refreshWireless()
+    }
+    private fun refreshWireless() {
+        if (!resumed || !surfaceReady) return
+        val address = wifiAddress()
+        if (wirelessAddress == address && (address == null || receivers.containsKey(true))) return
+        receiverTokens.remove(true); retryTokens.remove(true); listening.remove(true)
+        receivers.remove(true)?.close()
+        if (activeTransport == true) setStreaming(false)
+        if (wirelessAddress != address) listenerRetries.remove(true)
+        wirelessAddress = address
+        if (address != null) startReceiver(true, address)
+        updateMenuState()
+    }
+    private fun setStreaming(active: Boolean) {
+        streaming = active
+        if (!active) activeTransport = null
+        latestStats = null; fpsOverlay.showRate(null)
+        controlContainer.visibility = if (active) View.GONE else View.VISIBLE
+        idleCover.visibility = if (active) View.GONE else View.VISIBLE
+        updateWifiLatency(active && activeTransport == true)
+    }
+    private fun startReceiver(wireless: Boolean, address: String) {
+        retryTokens.remove(wireless)
+        val token = Any(); receiverTokens[wireless] = token
         val mode = display!!.mode; val owner = generation; actualRefresh = mode.refreshRate
         val width = maxOf(mode.physicalWidth, mode.physicalHeight); val height = minOf(mode.physicalWidth, mode.physicalHeight)
-        receiver = Receiver(address, key, surface.holder.surface, width, height, display?.hdrCapabilities?.supportedHdrTypes ?: intArrayOf(),
+        fun current() = owner == generation && resumed && receiverTokens[wireless] === token
+        receivers[wireless] = Receiver(address, key, surface.holder.surface, width, height, display?.hdrCapabilities?.supportedHdrTypes ?: intArrayOf(),
+            lease = sessionLease, wifiAddress = { wirelessAddress }, listening = { available -> runOnUiThread {
+                if (!current()) return@runOnUiThread
+                if (available) {
+                    listening.add(wireless); listenerRetries.remove(wireless)
+                } else {
+                    listening.remove(wireless); receiverTokens.remove(wireless)
+                    receivers.remove(wireless)?.close()
+                    val attempt = listenerRetries[wireless] ?: 0
+                    if (attempt < 5) {
+                        listenerRetries[wireless] = attempt + 1
+                        val retry = Any(); retryTokens[wireless] = retry
+                        // Retry only this endpoint. Generation, token and address
+                        // checks cancel retries after pause, re-pairing or a new IP.
+                        root.postDelayed({
+                            if (owner == generation && resumed && surfaceReady && retryTokens[wireless] === retry && !receiverTokens.containsKey(wireless) &&
+                                (!wireless || wirelessAddress == address)) startReceiver(wireless, address)
+                        }, 500L shl attempt)
+                    }
+                }
+                updateMenuState()
+            } },
             status = { message, active -> runOnUiThread {
-                if (owner != generation || !resumed) return@runOnUiThread
+                if (!current()) return@runOnUiThread
+                if (!active && activeTransport != wireless) return@runOnUiThread
                 connectionText = message
-                if (active && !streaming) { controlContainer.visibility = View.GONE; latestStats = null; fpsOverlay.showRate(null) }
-                if (!active) { controlContainer.visibility = View.VISIBLE; latestStats = null }
-                streaming = active; updateWifiLatency(wireless && streaming)
-                idleCover.visibility = if (streaming) View.GONE else View.VISIBLE
+                if (active) activeTransport = wireless
+                setStreaming(active)
                 actualRefresh = display?.mode?.refreshRate ?: 0f; updateMenuState()
             } }, stats = { stats -> runOnUiThread {
-                if (owner != generation || !resumed || !streaming) return@runOnUiThread
+                if (!current() || !streaming || activeTransport != wireless) return@runOnUiThread
                 actualRefresh = display?.mode?.refreshRate ?: 0f
                 latestStats = stats; fpsOverlay.showRate(stats.fps); updateMenuState()
             } }, mode = { fps -> runOnUiThread {
-                if (owner != generation || !resumed) return@runOnUiThread
+                if (!current()) return@runOnUiThread
                 val selected = display?.supportedModes?.filter { maxOf(it.physicalWidth, it.physicalHeight) == width && minOf(it.physicalWidth, it.physicalHeight) == height }
                     ?.minByOrNull { kotlin.math.abs(it.refreshRate - fps) }
                 window.attributes = window.attributes.apply { preferredDisplayModeId = selected?.modeId ?: 0; preferredRefreshRate = fps.toFloat() }
@@ -245,13 +305,19 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
     }
     private fun stop() {
-        generation++; updateWifiLatency(false); streaming = false; latestStats = null
+        generation++; receiverTokens.clear(); retryTokens.clear(); listening.clear(); listenerRetries.clear(); updateWifiLatency(false); streaming = false; activeTransport = null; latestStats = null
         if (::fpsOverlay.isInitialized) fpsOverlay.updateVisibility(false)
         if (::idleCover.isInitialized) idleCover.visibility = View.VISIBLE
-        receiver?.close(); receiver = null
+        receivers.values.forEach { it.close() }; receivers.clear(); wirelessAddress = null
+        if (::controlContainer.isInitialized) controlContainer.visibility = View.VISIBLE
     }
     override fun onResume() { super.onResume(); resumed = true; restart() }
     override fun onPause() { resumed = false; stop(); super.onPause() }
+    override fun onDestroy() {
+        networkCallback?.let { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) }
+        networkCallback = null
+        super.onDestroy()
+    }
     override fun onConfigurationChanged(configuration: Configuration) { super.onConfigurationChanged(configuration); root.post { sizeMenu() } }
     override fun surfaceCreated(holder: SurfaceHolder) { surfaceReady = true; restart() }
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}

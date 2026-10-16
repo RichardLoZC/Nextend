@@ -6,11 +6,10 @@ import AppKit
     private let statusLabel = glassText("", size: 13, muted: true)
     private let rate = NSSegmentedControl(labels: ["60 fps", "90 fps", "120 fps"], trackingMode: .selectOne, target: nil, action: nil)
     private let resolution = NSPopUpButton()
-    private let codec = NSPopUpButton()
     private let hdr = NSSwitch()
     private let colorLabel = glassText("SDR · BT.709", size: 12, weight: .medium)
     private let transport = NSSegmentedControl(labels: ["", ""], trackingMode: .selectOne, target: nil, action: nil)
-    private let language = NSPopUpButton()
+    private let language = GlassActionButton()
     private let ip = NSTextField(string: UserDefaults.standard.string(forKey: "padIP") ?? "")
     private let interface = NSTextField(string: UserDefaults.standard.string(forKey: "interface") ?? "en0")
     private var connectButton: NSButton!
@@ -69,7 +68,9 @@ import AppKit
         guard let fps = Int(value("--fps", "60")), let width = Int(value("--width", "3200")), let height = Int(value("--height", "2136")),
               let bitrate = Int(value("--bitrate", "45")), let seconds = Double(value("--seconds", (options.synthetic || options.capturePattern) ? "30" : "0")), seconds.isFinite, seconds >= 0,
               (5...120).contains(bitrate) else { throw BridgeError("命令行参数无效。") }
-        options.profile = Profile(width: width, height: height, fps: fps, bitrate: bitrate * 1_000_000, codec: value("--codec", "hevc"))
+        guard let preference = CodecPreference(rawValue: value("--codec", "auto")) else { throw BridgeError("编码参数需要 auto、hevc 或 h264。") }
+        options.codecPreference = preference
+        options.profile = Profile(width: width, height: height, fps: fps, bitrate: bitrate * 1_000_000, codec: preference == .h264 ? "h264" : "hevc")
         options.requestedHDR = arguments.contains("--hdr") || arguments.contains("--require-hdr")
         options.profile.color = options.requestedHDR ? .hlg : .sdr
         options.requireHDR = arguments.contains("--require-hdr")
@@ -102,8 +103,10 @@ import AppKit
         }
         let mark = NSImageView(); mark.image = NSImage(named: "AppIcon"); mark.imageScaling = .scaleProportionallyUpOrDown
         mark.setAccessibilityLabel("Nextend"); mark.widthAnchor.constraint(equalToConstant: 40).isActive = true; mark.heightAnchor.constraint(equalToConstant: 40).isActive = true
-        language.addItems(withTitles: ["中文", "English"]); language.target = self; language.action = #selector(languageChanged)
+        language.target = self; language.action = #selector(languageChanged)
         language.setAccessibilityLabel("语言 / Language")
+        language.widthAnchor.constraint(equalToConstant: 84).isActive = true
+        language.heightAnchor.constraint(equalToConstant: 32).isActive = true
         let headerSpace = NSView(); headerSpace.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let header = glassStack([mark, glassText("Nextend", size: 23, weight: .semibold), headerSpace, language], vertical: false, spacing: 14)
         header.heightAnchor.constraint(equalToConstant: 42).isActive = true
@@ -124,8 +127,7 @@ import AppKit
         for segment in 0..<2 { transport.setWidth(133, forSegment: segment) }
         for segment in 0..<3 { rate.setWidth(88, forSegment: segment) }
         resolution.addItems(withTitles: ["3200 × 2136", "2400 × 1600"])
-        codec.addItems(withTitles: ["HEVC", "H.264"]); codec.target = self; codec.action = #selector(codecChanged)
-        for popup in [resolution, codec] { popup.controlSize = .large; popup.font = .systemFont(ofSize: 13) }
+        resolution.controlSize = .large; resolution.font = .systemFont(ofSize: 13)
         for field in [ip, interface] { field.font = .monospacedSystemFont(ofSize: 12, weight: .regular); field.bezelStyle = .roundedBezel; field.heightAnchor.constraint(equalToConstant: 30).isActive = true }
         let addresses = glassStack([group("Pad IP", "Pad IP", ip), group("网卡", "Interface", interface)], vertical: false, spacing: 10)
         interface.widthAnchor.constraint(equalToConstant: 70).isActive = true
@@ -140,7 +142,7 @@ import AppKit
         let rightContents = fill(glassStack([
             label("连接与画质", "Connection & quality", size: 18, weight: .semibold), transport,
             group("分辨率", "Resolution", resolution), group("目标帧率", "Target frame rate", rate),
-            group("编码", "Codec", codec), addresses, colorRow, spacer, connectButton
+            addresses, colorRow, spacer, connectButton
         ], spacing: 20))
         let right = GlassSurface(); right.embed(rightContents); right.widthAnchor.constraint(equalToConstant: 338).isActive = true
         let main = glassStack([left, right], vertical: false, spacing: 18)
@@ -153,14 +155,14 @@ import AppKit
         let root = fill(glassStack([header, main, footer], spacing: 18))
         root.translatesAutoresizingMaskIntoConstraints = false; background.addSubview(root)
         NSLayoutConstraint.activate([root.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 24), root.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -24), root.topAnchor.constraint(equalTo: background.topAnchor, constant: 18), root.bottomAnchor.constraint(equalTo: background.bottomAnchor, constant: -20)])
-        settingControls = [rate, transport, resolution, codec, ip, interface, hdr]
+        settingControls = [rate, transport, resolution, ip, interface, hdr]
         refreshLanguage(); showWindow()
     }
-    @objc private func languageChanged() { AppLanguage.select(english: language.indexOfSelectedItem == 1); refreshLanguage() }
-    @objc private func selectLanguage(_ sender: NSMenuItem) { AppLanguage.select(english: sender.tag == 1); refreshLanguage() }
+    @objc private func languageChanged() { AppLanguage.select(english: !AppLanguage.english); refreshLanguage() }
     private func refreshLanguage() {
         localizedBindings.forEach { $0() }
-        language.selectItem(at: AppLanguage.english ? 1 : 0)
+        language.title = AppLanguage.english ? "中文" : "English"; language.needsDisplay = true
+        language.setAccessibilityLabel(AppLanguage.english ? "切换到中文" : "Switch to English")
         transport.setLabel(L("USB 有线", "USB"), forSegment: 0); transport.setLabel(L("加密无线", "Encrypted Wi-Fi"), forSegment: 1)
         rate.toolTip = L("60 fps 已验证；90 / 120 fps 为实验档，实际帧率取决于设备与网络。", "60 fps has been tested. 90 / 120 fps are experimental; actual rates depend on the device and network.")
         ip.placeholderString = L("Pad 的 IPv4 地址", "Pad IPv4 address")
@@ -192,11 +194,7 @@ import AppKit
         menu.addItem(item(L("打开 Nextend", "Open Nextend"), #selector(showWindow)))
         let disconnect = item(L("断开连接", "Disconnect"), #selector(disconnect)); disconnect.isEnabled = session != nil; menu.addItem(disconnect)
         menu.addItem(.separator())
-        let languages = item("语言 / Language", nil); languages.submenu = NSMenu()
-        for (index, name) in ["中文", "English"].enumerated() {
-            let choice = item(name, #selector(selectLanguage(_:))); choice.tag = index; choice.state = (index == 1) == AppLanguage.english ? .on : .off; languages.submenu?.addItem(choice)
-        }
-        menu.addItem(languages)
+        menu.addItem(item(AppLanguage.english ? "切换到中文" : "Switch to English", #selector(languageChanged)))
         let tests = item(L("诊断", "Diagnostics"), nil); tests.submenu = NSMenu(); tests.submenu?.autoenablesItems = false
         for (name, selector) in [(L("桌面采集测试 · 30 秒", "Desktop capture test · 30 s"), #selector(desktopTest)), (L("合成测试 · 30 秒", "Synthetic test · 30 s"), #selector(testPattern))] {
             let test = item(name, selector); test.isEnabled = session == nil && !restartRequired; tests.submenu?.addItem(test)
@@ -210,8 +208,7 @@ import AppKit
     @objc private func showWindow() { window?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
     @objc private func quit() { NSApp.terminate(nil) }
     @objc private func transportChanged() { wirelessFields?.isHidden = transport.selectedSegment == 0 }
-    @objc private func hdrChanged() { if hdr.state == .on { codec.selectItem(at: 0) }; renderConnection() }
-    @objc private func codecChanged() { if codec.indexOfSelectedItem != 0 { hdr.state = .off }; hdrChanged() }
+    @objc private func hdrChanged() { renderConnection() }
     @objc private func showHDRInfo() {
         let alert = NSAlert(); alert.messageText = "HDR · HLG 10-bit"
         alert.informativeText = L("使用 HEVC Main10 和 HLG。建议先用 USB、60 fps；不可用时自动回退 SDR 并显示原因。\n\nHDR 内容才具有更亮的高光。当前不提供 HDR10 / Dolby Vision。更改画质需先断开连接。", "Uses HEVC Main10 and HLG. Start with USB at 60 fps. If HDR is unavailable, Nextend falls back to SDR and shows the reason.\n\nBrighter highlights require HDR content. HDR10 and Dolby Vision are not supported. Disconnect before changing quality settings.")
@@ -219,7 +216,7 @@ import AppKit
     }
     private func uiOptions(synthetic: Bool) -> SessionOptions {
         var options = SessionOptions(); options.synthetic = synthetic; options.seconds = synthetic ? 30 : 0
-        options.profile.fps = [60, 90, 120][rate.selectedSegment]; options.profile.codec = codec.indexOfSelectedItem == 0 ? "hevc" : "h264"
+        options.profile.fps = [60, 90, 120][rate.selectedSegment]
         options.requestedHDR = hdr.state == .on; options.profile.color = options.requestedHDR ? .hlg : .sdr
         if resolution.indexOfSelectedItem == 1 { options.profile.width = 2400; options.profile.height = 1600 }
         options.wireless = transport.selectedSegment == 1; options.host = ip.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -245,6 +242,10 @@ import AppKit
         connectionState = .connecting; activeWireless = options.wireless; outputColor = options.profile.color; hdrVerified = false; fallbackUsed = options.fallbackReason != nil
         connectButton?.isEnabled = true; settingControls.forEach { $0.isEnabled = false }
         renderConnection(); rebuildMenus()
+        session.onPeerAddress = { [weak self, weak session] address in
+            guard let self, let session, self.session === session else { return }
+            self.ip.stringValue = address; UserDefaults.standard.set(address, forKey: "padIP")
+        }
         session.onStatus = { [weak self, weak session] message, kind in
             guard let self, let session, self.session === session else { return }
             switch kind {

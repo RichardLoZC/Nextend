@@ -36,12 +36,41 @@ struct Profile {
     var bitrate = 45_000_000
     var codec = "hevc"
     var color: VideoColor = .sdr
+    // Lower-resolution high-refresh capture benefits from a small extra window.
+    // At native resolution it only adds encoder latency. Never exceed the Pad's
+    // six-frame decoder accounting limit, including at a 120 fps target.
+    var frameCredits: Int { fps > 60 && width * height <= 2400 * 1600 ? 6 : 4 }
     func validate() throws {
+        guard color != .hlg || codec == "hevc" else { throw BridgeError("HDR 需要 HEVC Main10；H.264 仅支持 SDR。") }
         guard [60, 90, 120].contains(fps), width >= 640, width <= 3840,
               height >= 480, height <= 2160, width % 4 == 0, height % 4 == 0,
               ["hevc", "h264"].contains(codec), (color != .hlg || codec == "hevc"),
               (5_000_000...120_000_000).contains(bitrate)
         else { throw BridgeError("无效画面配置：需要偶数 HiDPI 尺寸和 60/90/120 fps。") }
+    }
+}
+
+/// The GUI always uses automatic selection. Explicit preferences exist only
+/// for CLI diagnostics; negotiation still requires a compatible hardware path.
+enum CodecPreference: String {
+    case auto, hevc, h264
+    func select(supported: [String], color: VideoColor) -> String? {
+        let order = color == .hlg ? ["hevc"] : (self == .h264 ? ["h264", "hevc"] : ["hevc", "h264"])
+        return order.first { supported.contains($0) }
+    }
+}
+
+struct EncoderRecovery {
+    private(set) var dropped: UInt64 = 0
+    private var firstDropNS: UInt64?
+    mutating func didDrop(at now: UInt64) {
+        dropped += 1
+        if firstDropNS == nil { firstDropNS = now }
+    }
+    mutating func didEncode() { firstDropNS = nil }
+    func stalled(at now: UInt64) -> Bool {
+        guard let first = firstDropNS, now >= first else { return false }
+        return now - first > 3_000_000_000
     }
 }
 
