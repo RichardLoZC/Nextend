@@ -1,0 +1,20 @@
+work/
+outputs/
+.DS_Store
+android/.gradle/
+android/.kotlin/
+android/local.properties
+android/**/build/
+*.log
+
+# Local credentials, signing identities and tooling state
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.jks
+*.keystore
+.idea/
+__pycache__/
+*.pyc

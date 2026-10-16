@@ -1,0 +1,4 @@
+interface:
+  display_name: "液态玻璃界面"
+  short_description: "复用清透材质、明亮边缘与流动选中态，适配网页和原生应用"
+  default_prompt: "使用 $liquid-glass-interface 优化当前界面，保留原有功能并验证可读性与交互状态。"

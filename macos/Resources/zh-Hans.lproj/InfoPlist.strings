@@ -1,0 +1,2 @@
+"NSLocalNetworkUsageDescription" = "连接已配对的平板，以加密方式传输拓展桌面。";
+"NSScreenCaptureUsageDescription" = "采集 Nextend 创建的虚拟拓展屏，传送至平板。";
