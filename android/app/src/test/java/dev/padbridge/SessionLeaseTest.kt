@@ -9,7 +9,9 @@ import java.util.concurrent.atomic.AtomicInteger
 class SessionLeaseTest {
     @Test fun anotherTransportCannotStealOrReleaseTheActiveDecoder() {
         val lease = SessionLease(); val usb = Any(); val wifi = Any()
+        assertTrue(lease.isAvailable())
         assertTrue(lease.acquire(usb))
+        assertFalse(lease.isAvailable())
         assertFalse(lease.acquire(wifi))
         lease.release(wifi)
         assertFalse(lease.acquire(wifi))
@@ -18,6 +20,7 @@ class SessionLeaseTest {
         lease.release(usb) // Late cleanup from the previous session is harmless.
         assertFalse(lease.acquire(usb))
         lease.release(wifi)
+        assertTrue(lease.isAvailable())
         assertTrue(lease.acquire(usb))
     }
     @Test fun simultaneousAuthenticatedConnectionsHaveOnlyOneWinner() {

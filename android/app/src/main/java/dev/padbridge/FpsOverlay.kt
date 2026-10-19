@@ -42,7 +42,7 @@ class FpsOverlay(context: Context) : View(context) {
     init {
         visibility = GONE
         importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
-        isClickable = true; isFocusable = true
+        isClickable = false; isFocusable = false
         applyStyle(); showRate(null)
     }
     fun attach(parent: FrameLayout) { parent.addView(this, FrameLayout.LayoutParams(-1, -1)) }
@@ -53,7 +53,7 @@ class FpsOverlay(context: Context) : View(context) {
     }
     private fun applyRate() {
         rateText = latestText
-        contentDescription = rateText + tr("，拖动调整位置，点按打开菜单", ", drag to move, tap for controls")
+        contentDescription = rateText + tr("", "")
         measureBadge(); place(); invalidate()
     }
     fun setEnabledByUser(value: Boolean) { enabledByUser = value; prefs.edit().putBoolean("fps.enabled", value).apply() }
@@ -103,27 +103,10 @@ class FpsOverlay(context: Context) : View(context) {
         if (gesture?.dragged == true) canvas.drawRoundRect(badge, 7 * density, 7 * density, edgePaint)
         canvas.drawText(rateText, badge.left + 8 * density, badge.top + 4 * density - textPaint.fontMetrics.ascent, textPaint)
     }
-    override fun onTouchEvent(event: MotionEvent): Boolean {
-        when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                if (!badge.contains(event.x, event.y)) return false
-                activePointer = event.getPointerId(0)
-                gesture = OverlayDrag(event.x, event.y, badge.left, badge.top, ViewConfiguration.get(context).scaledTouchSlop.toFloat(), badgeHeight + 20 * density)
-                parent.requestDisallowInterceptTouchEvent(true)
-                return true
-            }
-            MotionEvent.ACTION_MOVE, MotionEvent.ACTION_UP -> {
-                val drag = gesture ?: return false
-                val index = event.findPointerIndex(activePointer)
-                if (index < 0) { finishGesture(false); return true }
-                drag.move(event.getX(index), event.getY(index), (height - badgeHeight).coerceAtLeast(0f))?.let { moveBadge(it.first, it.second) }
-                if (event.actionMasked == MotionEvent.ACTION_UP) finishGesture(true)
-            }
-            MotionEvent.ACTION_POINTER_UP -> if (event.getPointerId(event.actionIndex) == activePointer) finishGesture(false)
-            MotionEvent.ACTION_CANCEL -> finishGesture(false)
-        }
-        return gesture != null || event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL
+    fun setPosition(x: Float, y: Float) {
+        position = OverlayPosition(x.coerceIn(0f, 1f), y.coerceIn(0f, 1f)); place(); savePosition()
     }
+    override fun onTouchEvent(event: MotionEvent): Boolean = false
     private fun finishGesture(allowClick: Boolean) {
         val drag = gesture ?: return
         if (drag.dragged) savePosition()
@@ -151,14 +134,6 @@ class FpsOverlay(context: Context) : View(context) {
             getLocationInWindow(origin)
             info.setBoundsInWindow(Rect(bounds).apply { offset(origin[0], origin[1]) })
         }
-        info.addAction(AccessibilityNodeInfo.AccessibilityAction(0x01020001, tr("移到左上角", "Move to top left")))
-        info.addAction(AccessibilityNodeInfo.AccessibilityAction(0x01020002, tr("移到右上角", "Move to top right")))
-        info.addAction(AccessibilityNodeInfo.AccessibilityAction(0x01020003, tr("移到左下角", "Move to bottom left")))
-        info.addAction(AccessibilityNodeInfo.AccessibilityAction(0x01020004, tr("移到右下角", "Move to bottom right")))
-    }
-    override fun performAccessibilityAction(action: Int, arguments: android.os.Bundle?): Boolean {
-        val corner = when (action) { 0x01020001 -> OverlayPosition(0f, 0f); 0x01020002 -> OverlayPosition(1f, 0f); 0x01020003 -> OverlayPosition(0f, 1f); 0x01020004 -> OverlayPosition(1f, 1f); else -> null }
-        if (corner != null) { finishGesture(false); position = corner; place(); savePosition(); return true }
-        return super.performAccessibilityAction(action, arguments)
+
     }
 }

@@ -13,6 +13,7 @@ final class SecureChannel {
     private var receiveSequence: UInt64 = 0
     private var sendKey: SymmetricKey!
     private var receiveKey: SymmetricKey!
+    private var packetMaximum = SecureChannel.maxPacket
 
     init(host: String, port: UInt16, key: Data, interface: String?) throws {
         guard key.count == 32 else { throw BridgeError("配对密钥无效，请重新通过 USB 配对。") }
@@ -47,22 +48,64 @@ final class SecureChannel {
                 guard err == 0 else { throw BridgeError("Pad 尚未监听或网络阻断：\(String(cString: strerror(err)))") }
             }
             _ = fcntl(fd, F_SETFL, flags)
-            let localNonce = PairCrypto.random(32)
-            try writeRaw(Data("PDB1".utf8) + localNonce)
-            let reply = try readRaw(maximum: 64, timeoutSeconds: 5)
-            guard reply.count == 64 else { throw BridgeError("配对协议版本不匹配。") }
-            let salt = localNonce + reply.prefix(32)
-            guard PairCrypto.verify(reply.suffix(32), key: key, role: "pad", salt: salt) else { throw BridgeError("Pad 身份验证失败，请用 USB 重新配对。") }
-            try writeRaw(PairCrypto.proof(key: key, role: "mac", salt: salt))
-            sendKey = PairCrypto.derive(key: key, salt: salt, direction: "mac-to-pad")
-            receiveKey = PairCrypto.derive(key: key, salt: salt, direction: "pad-to-mac")
+            try authenticateVideo(key: key)
         } catch { ownsFD = false; Darwin.close(fd); throw error }
+    }
+
+    /// PDR1 only negotiates the handoff. Video always uses a fresh PDB1 nonce/key.
+    init(connected socket: ConnectedSocket, key: Data) throws {
+        fd = try socket.take()
+        do {
+            guard key.count == 32 else { throw BridgeError("配对密钥无效，请重新通过 USB 配对。") }
+            var one: Int32 = 1
+            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout.size(ofValue: one)))
+            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, socklen_t(MemoryLayout.size(ofValue: one)))
+            var timeout = timeval(tv_sec: 8, tv_usec: 0)
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout.size(ofValue: timeout)))
+            try authenticateVideo(key: key)
+        } catch { ownsFD = false; Darwin.close(fd); throw error }
+    }
+    private func authenticateVideo(key: Data) throws {
+        let localNonce = PairCrypto.random(32)
+        try writeRaw(Data("PDB1".utf8) + localNonce)
+        let reply = try readRaw(maximum: 64, timeoutSeconds: 5)
+        guard reply.count == 64 else { throw BridgeError("配对协议版本不匹配。") }
+        let salt = localNonce + reply.prefix(32)
+        guard PairCrypto.verify(reply.suffix(32), key: key, role: "pad", salt: salt) else { throw BridgeError("Pad 身份验证失败，请用 USB 重新配对。") }
+        try writeRaw(PairCrypto.proof(key: key, role: "mac", salt: salt))
+        sendKey = PairCrypto.derive(key: key, salt: salt, direction: "mac-to-pad")
+        receiveKey = PairCrypto.derive(key: key, salt: salt, direction: "pad-to-mac")
+    }
+
+    func detachSocket() throws -> ConnectedSocket {
+        stateLock.lock(); defer { stateLock.unlock() }
+        guard ownsFD, !stopped else { throw BridgeError("连接已取消。") }
+        ownsFD = false; stopped = true
+        return ConnectedSocket(fd)
+    }
+
+    /// Separate domain and keys: a connection request cannot be replayed as video/control.
+    init(requestFD: Int32, key: Data) throws {
+        fd = requestFD; packetMaximum = 4096
+        do {
+            var one: Int32 = 1
+            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout.size(ofValue: one)))
+            var timeout = timeval(tv_sec: 3, tv_usec: 0)
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout.size(ofValue: timeout)))
+            let hello = try readRaw(maximum: 36, timeoutSeconds: 3)
+            guard hello.count == 36, hello.prefix(4) == Data("PDR1".utf8), key.count == 32 else { throw BridgeError("连接请求无效。") }
+            let nonce = PairCrypto.random(32), salt = Data(hello.suffix(32)) + nonce
+            try writeRaw(nonce + PairCrypto.proof(key: key, role: "request-mac", salt: salt))
+            guard PairCrypto.verify(try readRaw(maximum: 32, timeoutSeconds: 3), key: key, role: "request-pad", salt: salt) else { throw BridgeError("连接请求认证失败。") }
+            sendKey = PairCrypto.derive(key: key, salt: salt, direction: "request-mac-to-pad")
+            receiveKey = PairCrypto.derive(key: key, salt: salt, direction: "request-pad-to-mac")
+        } catch { ownsFD = false; throw error }
     }
 
     deinit { if ownsFD { Darwin.close(fd) } }
     func close() {
         stateLock.lock(); defer { stateLock.unlock() }
-        if !stopped { stopped = true; shutdown(fd, SHUT_RDWR) }
+        if ownsFD && !stopped { stopped = true; shutdown(fd, SHUT_RDWR) }
     }
     private func readExactly(_ count: Int, deadline: UInt64) throws -> Data {
         var result = Data(count: count)
@@ -110,7 +153,7 @@ final class SecureChannel {
         try sendBody(Data([1]) + JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]))
     }
     func receive() throws -> Data {
-        let result = try PairCrypto.open(readRaw(), key: receiveKey, sequence: receiveSequence)
+        let result = try PairCrypto.open(readRaw(maximum: packetMaximum, timeoutSeconds: packetMaximum == 4096 ? 3 : 8), key: receiveKey, sequence: receiveSequence)
         guard receiveSequence < UInt64.max else { throw BridgeError("会话序号耗尽。") }
         receiveSequence += 1; return result
     }

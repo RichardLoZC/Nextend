@@ -1,7 +1,6 @@
 package dev.padbridge
 
 import android.app.Activity
-import android.app.AlertDialog
 import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
@@ -24,12 +23,19 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var surface: SurfaceView
     private lateinit var idleCover: View
     private lateinit var fpsOverlay: FpsOverlay
+    private lateinit var touchSurface: TouchSurface
     private lateinit var controlContainer: ScrollView
     private lateinit var connectionInfo: TextView
     private lateinit var idleArt: View
-    private lateinit var hideButton: Button
+    private lateinit var connectButton: Button
+    private var connectionRequest: PadConnectRequest? = null
+    private var requesting = false
+    private var requestToken = 0
+    private var requestMessage: String? = null
     private lateinit var heading: TextView
     private val receivers = mutableMapOf<Boolean, Receiver>()
+    @Volatile private var usbReceiver: Receiver? = null
+    @Volatile private var reverseReceiver: Receiver? = null
     private val receiverTokens = mutableMapOf<Boolean, Any>()
     private val listening = mutableSetOf<Boolean>()
     private val listenerRetries = mutableMapOf<Boolean, Int>()
@@ -46,22 +52,31 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var connectionText = UiText("用 USB 连接 Mac，在 Mac 上点击连接。", "Connect the Mac with USB, then click Connect on the Mac.")
     private var latestStats: RenderStats? = null
     @Volatile private var actualRefresh = 60f
+    private val pairingLock = Any()
     private lateinit var key: ByteArray
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Language.load(this)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         key = readKey()
-        root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        root = FrameLayout(this).apply {
+            setBackgroundColor(Color.BLACK)
+            // A gesture belongs entirely to the video or the FPS badge. A
+            // second finger on the badge must not split off a desktop drag.
+            isMotionEventSplittingEnabled = false
+        }
         surface = SurfaceView(this); surface.holder.addCallback(this)
         root.addView(surface, FrameLayout.LayoutParams(-1, -1))
         // Keep video on its own Surface. Only the small UI overlay changes language.
         idleCover = GlassBackdrop(this); root.addView(idleCover, FrameLayout.LayoutParams(-1, -1))
         fpsOverlay = FpsOverlay(this); fpsOverlay.attach(root)
-        surface.setOnClickListener { if (streaming) toggleMenu() }
-        fpsOverlay.setOnClickListener { if (streaming) toggleMenu() }
+        touchSurface = TouchSurface(surface)
+        surface.setOnTouchListener { view, event -> if (streaming) touchSurface.onTouch(view, event) else false }
         buildMenu()
-        root.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> sizeMenu() }
+        root.addOnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
+            if (right - left != oldRight - oldLeft || bottom - top != oldBottom - oldTop) touchSurface.cancel()
+            sizeMenu()
+        }
         setContentView(root)
         window.insetsController?.hide(WindowInsets.Type.systemBars())
         window.insetsController?.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
@@ -108,28 +123,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         idleArt = BridgeIllustration(this); add(idleArt, 120, 12)
         connectionInfo = text("", 13f, GlassColors.muted).apply { setPadding(0, dp(12), 0, dp(12)); setTextIsSelectable(true) }
         add(connectionInfo, top = 4)
-        val fps = Switch(this).apply {
-            text = tr("显示 FPS", "Show FPS"); textSize = 16f; setTextColor(GlassColors.ink); isChecked = fpsOverlay.enabledByUser
-            setOnCheckedChangeListener { _, checked -> fpsOverlay.setEnabledByUser(checked); fpsOverlay.updateVisibility(streaming) }
-        }
-        add(row(fps, button(tr("FPS 样式", "FPS style")) { showFpsSettings() }), top = 4)
-        val chinese = button("中文") { chooseLanguage(false) }
-        val english = button("English") { chooseLanguage(true) }
-        for ((view, selected) in listOf(chinese to !Language.english, english to Language.english)) styleSelected(view, selected)
-        add(row(chinese, english), top = 10)
-        add(button(tr("重新配对", "Pair again")) {
-            AlertDialog.Builder(this).setMessage(tr("断开当前连接并撤销配对？之后需要通过 USB 重新连接 Mac。", "Disconnect and revoke pairing? You will need USB to pair with the Mac again."))
-                .setPositiveButton(tr("重新配对", "Pair again")) { _, _ -> stop(); key = PairCrypto.random(32); File(filesDir, "pairing.key").writeBytes(key); restart() }
-                .setNegativeButton(tr("取消", "Cancel"), null).show()
-        }, 48, 10)
-        hideButton = button(tr("返回桌面", "Back to desktop")) { controlContainer.visibility = View.GONE }; add(hideButton, 48, 10)
+        connectButton = button(tr("连接", "Connect")) { requestConnection() }; add(connectButton, 48, 10)
         controlContainer = ScrollView(this).apply {
             isFillViewport = false; clipToPadding = false; setPadding(dp(12), dp(12), dp(12), dp(12)); addView(controls); visibility = visible
         }
         root.addView(controlContainer, FrameLayout.LayoutParams(dp(504), -2, Gravity.CENTER))
         updateMenuState(); sizeMenu()
     }
-    private fun chooseLanguage(english: Boolean) { Language.select(this, english); buildMenu(); fpsOverlay.showRate(latestStats?.fps) }
     private fun sizeMenu() {
         if (root.width == 0 || root.height == 0) return
         val width = minOf(dp(504), (root.width - dp(24)).coerceAtLeast(1))
@@ -139,77 +139,43 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val height = minOf(controlContainer.measuredHeight, maximum)
         if (params.width != width || params.height != height) { params.width = width; params.height = height; controlContainer.layoutParams = params }
     }
-    private fun toggleMenu() { controlContainer.visibility = if (controlContainer.visibility == View.VISIBLE) View.GONE else View.VISIBLE; sizeMenu() }
-    private fun styleSelected(view: Button, selected: Boolean) {
-        view.background = GlassPanelDrawable(resources.displayMetrics.density, selected, 16f)
-        view.setTextColor(if (selected) Color.WHITE else GlassColors.ink); view.isSelected = selected
-        view.contentDescription = view.text.toString() + if (selected) tr("，已选择", ", selected") else ""
-    }
     private fun updateMenuState() {
         if (!::connectionInfo.isInitialized) return
-        heading.text = if (streaming) tr("已连接", "Connected") else tr("等待连接", "Ready to connect")
-        idleArt.visibility = if (streaming) View.GONE else View.VISIBLE
-        hideButton.visibility = if (streaming) View.VISIBLE else View.GONE
-        var details = if (streaming) {
-            (if (activeTransport == true) tr("加密无线", "Encrypted Wi-Fi") else "USB") + " · " + connectionText.text
-        } else {
-            tr("在 Mac 上选择连接方式。首次使用请通过 USB 配对。", "Choose the connection on your Mac. Pair with USB on first use.") +
-                (if (true in listening && wirelessAddress != null) "\n" + tr("无线地址：", "Wi-Fi: ") + wirelessAddress else "") +
-                (if (false !in listening) "\n" + tr("USB 尚未就绪", "USB is not ready") else "")
-        }
-        if (streaming) latestStats?.let {
-            details += "\n" + tr("呈现", "Rendered") + String.format(Locale.ROOT, " %.1f fps · ", it.fps) + tr("面板", "Display") + String.format(Locale.ROOT, " %.0f Hz", it.displayHz)
-            details += "\n" + tr("解码", "Decoded") + String.format(Locale.ROOT, " %.1f fps · ", it.decodeFps) + tr("丢弃", "Dropped") + " ${it.dropped} · " + tr("温控", "Thermal") + " ${it.thermal}"
-        }
-        connectionInfo.text = details
+        heading.text = tr("等待连接", "Ready to connect")
+        connectionInfo.text = requestMessage ?: if (listening.isEmpty()) tr("正在准备连接…", "Preparing connection…") else ""
+        connectButton.isEnabled = !requesting && listening.isNotEmpty()
+        connectButton.text = if (requesting) tr("正在连接…", "Connecting…") else tr("连接", "Connect")
         fpsOverlay.updateVisibility(streaming); sizeMenu()
     }
-    private fun showFpsSettings() {
-        val body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(24), dp(8), dp(24), dp(8)) }
-        body.addView(text(tr("拖动 FPS 可调整位置。", "Drag the FPS overlay to move it."), 14f, GlassColors.muted))
-        val size = text("${fpsOverlay.sizeSp} sp", 16f); body.addView(size)
-        body.addView(SeekBar(this).apply {
-            min = 12; max = 64; progress = fpsOverlay.sizeSp; contentDescription = tr("字号", "Font size")
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(bar: SeekBar, value: Int, fromUser: Boolean) { if (fromUser) { fpsOverlay.setSize(value); size.text = "$value sp" } }
-                override fun onStartTrackingTouch(bar: SeekBar) {}
-                override fun onStopTrackingTouch(bar: SeekBar) {}
-            })
-        })
-        fun choice(title: String, names: List<String>, selected: Int, change: (Int) -> Unit): Spinner {
-            body.addView(text(title, 14f, GlassColors.muted))
-            val spinner = Spinner(this).apply {
-                adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, names)
-                setSelection(selected); contentDescription = title
-                onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-                    override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) { change(position) }
-                    override fun onNothingSelected(parent: AdapterView<*>?) {}
+    private fun requestConnection() {
+        if (requesting || streaming) return
+        requesting = true; requestMessage = null; updateMenuState()
+        val owner = generation; val token = ++requestToken
+        connectionRequest?.request(readKey()) { accepted -> runOnUiThread {
+            if (!resumed || owner != generation || token != requestToken || streaming) return@runOnUiThread
+            requesting = false
+            requestMessage = if (accepted) tr("等待 Mac…", "Waiting for Mac…") else tr("请打开已配对的 Mac。首次连接请在 Mac 上通过 USB 配对。", "Open the paired Mac. For first use, pair with USB from the Mac.")
+            updateMenuState()
+            // The request acknowledges intent, not a completed video connection.
+            // A Mac-side permission/network failure must not leave a stale wait.
+            if (accepted) root.postDelayed({
+                if (resumed && owner == generation && token == requestToken && !streaming) {
+                    requestMessage = tr("连接超时，请在 Mac 查看状态。", "Connection timed out. Check the Mac for details.")
+                    updateMenuState()
                 }
-            }
-            body.addView(spinner, LinearLayout.LayoutParams(-1, dp(48)))
-            return spinner
-        }
-        choice(tr("字体", "Font"), listOf(tr("无衬线", "Sans serif"), tr("等宽", "Monospace"), tr("衬线", "Serif")), fpsOverlay.fontIndex) { fpsOverlay.setFont(it) }
-        val colors = listOf(Color.WHITE, Color.BLACK, 0xFF75F5BD.toInt(), 0xFFFFDE59.toInt(), 0xFF72D8FF.toInt(), 0xFFFF8FB4.toInt())
-        val colorPicker = choice(tr("颜色", "Color"), listOf(tr("白色", "White"), tr("黑色", "Black"), tr("薄荷绿", "Mint"), tr("黄色", "Yellow"), tr("蓝色", "Blue"), tr("粉色", "Pink"), tr("自定义", "Custom")), colors.indexOf(fpsOverlay.textColorValue).let { if (it < 0) 6 else it }) { if (it < colors.size) fpsOverlay.setColor(colors[it]) }
-        body.addView(button(tr("自定义颜色…", "Custom color…")) {
-            val input = EditText(this).apply { setSingleLine(); setText(String.format(Locale.ROOT, "#%06X", fpsOverlay.textColorValue and 0xFFFFFF)); contentDescription = "RGB #RRGGBB" }
-            val dialog = AlertDialog.Builder(this).setTitle(tr("颜色 · #RRGGBB", "Color · #RRGGBB")).setView(input).setPositiveButton(tr("应用", "Apply"), null).setNegativeButton(tr("取消", "Cancel"), null).create()
-            dialog.setOnShowListener { dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                val value = input.text.toString().trim()
-                if (!Regex("#[0-9a-fA-F]{6}").matches(value)) input.error = tr("请输入六位 RGB 色值，如 #75F5BD", "Enter six RGB digits, e.g. #75F5BD")
-                else {
-                    val selectedColor = Color.parseColor(value); fpsOverlay.setColor(selectedColor)
-                    colorPicker.setSelection(colors.indexOf(selectedColor).let { if (it < 0) 6 else it })
-                    dialog.dismiss()
-                }
-            } }; dialog.show()
-        }, LinearLayout.LayoutParams(-1, dp(48)))
-        AlertDialog.Builder(this).setTitle(tr("FPS 样式", "FPS style")).setView(body).setPositiveButton(tr("完成", "Done"), null).show()
+            }, 20_000)
+        } }
     }
-    private fun readKey(): ByteArray {
+    private fun applySettings(value: org.json.JSONObject) {
+        Language.select(this, value.getString("language") == "en")
+        fpsOverlay.setEnabledByUser(value.getBoolean("showFPS")); fpsOverlay.setSize(value.getInt("size"))
+        fpsOverlay.setFont(value.getInt("font")); fpsOverlay.setColor(Color.parseColor(value.getString("color")))
+        fpsOverlay.setPosition(value.getDouble("x").toFloat(), value.getDouble("y").toFloat())
+        buildMenu(); updateMenuState()
+    }
+    private fun readKey(): ByteArray = synchronized(pairingLock) {
         val file = File(filesDir, "pairing.key")
-        return if (file.exists() && file.length() == 32L) file.readBytes() else PairCrypto.random(32).also { file.writeBytes(it) }
+        if (file.exists() && file.length() == 32L) file.readBytes() else PairCrypto.random(32).also { file.writeBytes(it) }
     }
     private fun wifiAddress(): String? {
         val manager = getSystemService(ConnectivityManager::class.java)
@@ -230,6 +196,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val address = wifiAddress()
         if (wirelessAddress == address && (address == null || receivers.containsKey(true))) return
         receiverTokens.remove(true); retryTokens.remove(true); listening.remove(true)
+        reverseReceiver = null
         receivers.remove(true)?.close()
         if (activeTransport == true) setStreaming(false)
         if (wirelessAddress != address) listenerRetries.remove(true)
@@ -238,8 +205,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         updateMenuState()
     }
     private fun setStreaming(active: Boolean) {
+        touchSurface.disable()
         streaming = active
         if (!active) activeTransport = null
+        requestToken++; connectionRequest?.setStreaming(active); requesting = false; requestMessage = null
         latestStats = null; fpsOverlay.showRate(null)
         controlContainer.visibility = if (active) View.GONE else View.VISIBLE
         idleCover.visibility = if (active) View.GONE else View.VISIBLE
@@ -251,13 +220,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val mode = display!!.mode; val owner = generation; actualRefresh = mode.refreshRate
         val width = maxOf(mode.physicalWidth, mode.physicalHeight); val height = minOf(mode.physicalWidth, mode.physicalHeight)
         fun current() = owner == generation && resumed && receiverTokens[wireless] === token
-        receivers[wireless] = Receiver(address, key, surface.holder.surface, width, height, display?.hdrCapabilities?.supportedHdrTypes ?: intArrayOf(),
+        receivers[wireless] = Receiver(address, { readKey() }, surface.holder.surface, width, height, display?.hdrCapabilities?.supportedHdrTypes ?: intArrayOf(),
             lease = sessionLease, wifiAddress = { wirelessAddress }, listening = { available -> runOnUiThread {
                 if (!current()) return@runOnUiThread
                 if (available) {
                     listening.add(wireless); listenerRetries.remove(wireless)
                 } else {
                     listening.remove(wireless); receiverTokens.remove(wireless)
+                    if (wireless) reverseReceiver = null else usbReceiver = null
                     receivers.remove(wireless)?.close()
                     val attempt = listenerRetries[wireless] ?: 0
                     if (attempt < 5) {
@@ -289,7 +259,23 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 val selected = display?.supportedModes?.filter { maxOf(it.physicalWidth, it.physicalHeight) == width && minOf(it.physicalWidth, it.physicalHeight) == height }
                     ?.minByOrNull { kotlin.math.abs(it.refreshRate - fps) }
                 window.attributes = window.attributes.apply { preferredDisplayModeId = selected?.modeId ?: 0; preferredRefreshRate = fps.toFloat() }
-            } }, refresh = { actualRefresh }, thermal = { getSystemService(PowerManager::class.java).currentThermalStatus }).also { it.start() }
+            } }, touchMode = { endpoint, value -> runOnUiThread {
+                if (current() && streaming && activeTransport == wireless) touchSurface.configure(value, endpoint)
+            } }, settings = { value -> runOnUiThread {
+                if (current() && streaming && activeTransport == wireless) applySettings(value)
+            } }, resetPairing = {
+                // Persist revocation before the authenticated acknowledgement.
+                synchronized(pairingLock) {
+                    val store = android.util.AtomicFile(File(filesDir, "pairing.key"))
+                    val out = store.startWrite()
+                    try { out.write(PairCrypto.random(32)); store.finishWrite(out) }
+                    catch (e: Exception) { store.failWrite(out); throw e }
+                }
+
+            }, pairingChanged = { runOnUiThread { key = readKey(); if (resumed) restart() } }, refresh = { actualRefresh }, thermal = { getSystemService(PowerManager::class.java).currentThermalStatus }).also {
+                if (wireless) reverseReceiver = it else usbReceiver = it
+                it.start()
+            }
     }
     private fun updateWifiLatency(active: Boolean) {
         if (active && wifiLock == null) {
@@ -305,14 +291,27 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
     }
     private fun stop() {
+        reverseReceiver = null; usbReceiver = null
+        requestToken++; connectionRequest?.setStreaming(false); requesting = false; requestMessage = null
+        if (::touchSurface.isInitialized) touchSurface.disable()
         generation++; receiverTokens.clear(); retryTokens.clear(); listening.clear(); listenerRetries.clear(); updateWifiLatency(false); streaming = false; activeTransport = null; latestStats = null
         if (::fpsOverlay.isInitialized) fpsOverlay.updateVisibility(false)
         if (::idleCover.isInitialized) idleCover.visibility = View.VISIBLE
         receivers.values.forEach { it.close() }; receivers.clear(); wirelessAddress = null
         if (::controlContainer.isInitialized) controlContainer.visibility = View.VISIBLE
     }
-    override fun onResume() { super.onResume(); resumed = true; restart() }
-    override fun onPause() { resumed = false; stop(); super.onPause() }
+    override fun onResume() {
+        super.onResume(); resumed = true
+        connectionRequest = PadConnectRequest(this, { readKey() }, ready = { automatic ->
+            // The Surface lease can outlive the old socket while MediaCodec
+            // finishes releasing it. Do not consume a new Mac handoff early.
+            sessionLease.isAvailable() && (reverseReceiver?.canAcceptReverse() == true || (!automatic && usbReceiver?.canAcceptReverse() == true))
+        }) { client, pairedKey, current ->
+            current() && reverseReceiver?.acceptReverse(client, pairedKey) == true
+        }
+        connectionRequest?.start(); restart()
+    }
+    override fun onPause() { resumed = false; connectionRequest?.close(); connectionRequest = null; requesting = false; stop(); super.onPause() }
     override fun onDestroy() {
         networkCallback?.let { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) }
         networkCallback = null

@@ -37,7 +37,7 @@ object PairCrypto {
     }
 }
 
-class SecureChannel(private val socket: Socket, key: ByteArray) : AutoCloseable {
+class SecureChannel(private val socket: Socket, key: ByteArray, private val requestClient: Boolean = false) : AutoCloseable {
     private val input = DataInputStream(socket.getInputStream())
     private val output = DataOutputStream(socket.getOutputStream())
     private val sendKey: ByteArray
@@ -49,14 +49,25 @@ class SecureChannel(private val socket: Socket, key: ByteArray) : AutoCloseable 
         require(key.size == 32)
         socket.tcpNoDelay = true
         socket.soTimeout = 5000
-        val hello = readRaw(36)
-        require(hello.size == 36 && hello.copyOfRange(0, 4).contentEquals("PDB1".toByteArray())) { "Protocol version mismatch" }
-        val nonce = PairCrypto.random(32)
-        val salt = hello.copyOfRange(4, 36) + nonce
-        writeRaw(nonce + PairCrypto.proof(key, "pad", salt))
-        require(MessageDigest.isEqual(readRaw(32), PairCrypto.proof(key, "mac", salt))) { "Pairing authentication failed" }
-        sendKey = PairCrypto.derive(key, salt, "pad-to-mac")
-        receiveKey = PairCrypto.derive(key, salt, "mac-to-pad")
+        if (requestClient) {
+            val nonce = PairCrypto.random(32)
+            writeRaw("PDR1".toByteArray() + nonce)
+            val reply = readRaw(64); require(reply.size == 64)
+            val salt = nonce + reply.copyOfRange(0, 32)
+            require(MessageDigest.isEqual(reply.copyOfRange(32, 64), PairCrypto.proof(key, "request-mac", salt)))
+            writeRaw(PairCrypto.proof(key, "request-pad", salt))
+            sendKey = PairCrypto.derive(key, salt, "request-pad-to-mac")
+            receiveKey = PairCrypto.derive(key, salt, "request-mac-to-pad")
+        } else {
+            val hello = readRaw(36)
+            require(hello.size == 36 && hello.copyOfRange(0, 4).contentEquals("PDB1".toByteArray())) { "Protocol version mismatch" }
+            val nonce = PairCrypto.random(32)
+            val salt = hello.copyOfRange(4, 36) + nonce
+            writeRaw(nonce + PairCrypto.proof(key, "pad", salt))
+            require(MessageDigest.isEqual(readRaw(32), PairCrypto.proof(key, "mac", salt))) { "Pairing authentication failed" }
+            sendKey = PairCrypto.derive(key, salt, "pad-to-mac")
+            receiveKey = PairCrypto.derive(key, salt, "mac-to-pad")
+        }
         handshakeDeadlineNS = null
         socket.soTimeout = 8000
     }
@@ -89,7 +100,7 @@ class SecureChannel(private val socket: Socket, key: ByteArray) : AutoCloseable 
     }
     fun receive(): ByteArray {
         check(receiveSequence < Long.MAX_VALUE)
-        val body = PairCrypto.open(readRaw(), receiveKey, receiveSequence); receiveSequence++
+        val body = PairCrypto.open(readRaw(if (requestClient) 4096 else MAX_PACKET), receiveKey, receiveSequence); receiveSequence++
         return body
     }
     override fun close() { runCatching { socket.close() } }

@@ -121,5 +121,16 @@
   "编码参数需要 auto、hevc 或 h264。": "Codec must be auto, hevc or h264.",
   "Pad 已连接其他会话，请先在 Mac 断开。": "The Pad is already connected. Disconnect the current session on the Mac first.",
   "编码器初始化失败，已切换为 {0}。": "Encoder initialization failed; switched to {0}.",
-  "硬件编码器丢帧后未恢复，请降低帧率或分辨率。": "The hardware encoder did not recover after dropping a frame. Lower the frame rate or resolution."
+  "硬件编码器丢帧后未恢复，请降低帧率或分辨率。": "The hardware encoder did not recover after dropping a frame. Lower the frame rate or resolution.",
+  "触屏消息无效。": "Invalid touch message.",
+  "触屏消息过于频繁。": "Touch message rate exceeded the limit.",
+  "触屏权限或拓展屏已不可用。": "Touch permission or the extended display is no longer available.",
+  "请更新 Pad 端以使用触屏。": "Update the Pad app to use touch.",
+  "请在系统设置中允许 Nextend 使用辅助功能，然后开启触屏。": "Allow Nextend in Accessibility in System Settings, then enable touch.",
+  "拒绝未协商的触屏消息。": "Rejected touch input that was not negotiated.",
+  "拒绝未知控制消息。": "Rejected an unknown control message.",
+  "配对已撤销，请通过 USB 重新连接。": "Pairing revoked. Reconnect using USB.",
+  "连接请求无效。": "Invalid connection request.",
+  "连接请求认证失败。": "Connection request authentication failed.",
+  "连接地址无效。": "Invalid connection address."
 }

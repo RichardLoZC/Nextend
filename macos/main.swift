@@ -72,6 +72,8 @@ func runSelfTests() throws {
     recovery.didDrop(at: 20_000_000_000)
     try check(recovery.stalled(at: 23_000_000_001), "single dropped static frame cannot hang forever")
     try HDRConverter.selfTest()
+    try touchSelfTest()
+    try reverseConnectionSelfTest()
     try check(AppMessage.translations.count > 100, "bundled English message catalog")
     let nested: AppMessage = "已回退 SDR：\(AppMessage(stringLiteral: "Pad 未就绪。"))"
     try check(nested.render(english: true) == "Fell back to SDR: The Pad is not ready.", "nested English status")

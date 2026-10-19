@@ -28,9 +28,9 @@ Mac 虚拟屏用稳定 vendor/product/serial 身份；逻辑尺寸为流分辨�
 - 原生 3200×2136 与 2400×1600 选项。
 - H.264 / HEVC 硬件编解码，BT.709 SDR 与 HLG 10-bit HDR。
 - USB 自动转发与配对；无线直接 IP、物理接口选择、配对加密。
-- 菜单内性能详情、可选且可拖动的 FPS 浮层、合成测试源、JSON 测试报告。
+- Mac 内性能详情、可选的 FPS 浮层、合成测试源、JSON 测试报告。
 - 连接超时、流控、关键帧恢复、停止和睡眠时资源释放。
-- Mac 端拒绝输入回传；Pad 点击只控制本地界面。
+- 触屏默认关闭。0.6.0 的可选扩展在现有认证连接中传输，Mac 本地开关与辅助功能权限共同授权；旧端仅传视频。
 
 ## 后续验收和扩展
 
@@ -54,15 +54,11 @@ HLG 请求在编解码协商前检查 Pad 的 HLG 面板与目标尺寸/帧率�
 
 ## 0.4.0 界面状态
 
-Mac 窗口不拥有连接生命周期；关闭最后一个窗口不会退出，菜单栏和 Dock 可恢复窗口。显式退出仍等待 Session 清理。活动连接通过 ProcessInfo activity 避免 App Nap，系统休眠仍按原逻辑断开。
+Mac 窗口不拥有连接生命周期；关闭最后一个窗口不会退出。0.5.1 起，主窗口关闭时将 activation policy 改为 accessory，隐藏 Dock 运行图标，保留状态栏与 Session；从状态栏或“应用程序”重新打开时先恢复 regular，再显示并激活原窗口。最小化不改变 activation policy。显式退出仍等待 Session 清理。活动连接通过 ProcessInfo activity 避免 App Nap，系统休眠仍按原逻辑断开。
 
 Mac Session 通过结构化 StatusKind 通知连接状态，界面不再解析中文字符串前缀。AppMessage 保留翻译键与参数，切换语言时重新渲染既有状态和错误，避免因翻译而触发业务逻辑。
 
-Pad 的语言切换只重建控制面板，不重建 SurfaceView、Activity 或 Receiver。统计与状态分开回调。FPS 来源为 MediaCodec OnFrameRenderedListener 在一个统计周期内的回调数除以单调时钟经过时间。菜单、浮层和 Mac 使用相同的统计来源；面板 Hz 单独显示。没有视频时隐藏浮层；连接开始时清空旧数值。
-
-FPS 在静止的透明 View 中绘制，拖动只更新绘制坐标，避免平移文字控件和视频 Surface 叠加时的重布局。拖动期间保留当前文字，松手后显示最新样本。徽标在手指上方显示，靠近底边时逐渐取消抬升，以便放到屏幕边缘。徽标外的普通触摸交给底层视频，点按徽标仍打开菜单。
-
-FPS 位置按父视图可移动范围归一化保存，拖动、字体改变及屏幕尺寸变化后限制在可见范围。用户偏好仅保存在 Android 私有 SharedPreferences；配对密钥仍与这些界面设置分开。
+Mac 通过已协商的 pad-settings 消息同步 Pad 语言与 FPS 样式、位置。Pad 仅重建等待页，不重建 SurfaceView、Activity 或 Receiver。FPS 来源为 MediaCodec OnFrameRenderedListener 回调数除以单调时钟经过时间；Mac 单独显示面板 Hz。FPS 在透明 View 内绘制，不截获触摸；位置限制在可见范围，用户偏好保存在 Mac UserDefaults 与 Pad 私有 SharedPreferences。配对密钥独立存储。
 
 ## 0.5.0 自动连接与编码
 
@@ -71,3 +67,11 @@ Pad 的两个接收器独立认证，共享 SessionLease，只有持有者能创
 Mac 的主界面只选择传输、分辨率、目标帧率和 HDR；编码由具体配置的硬件能力协商。默认优先 HEVC，SDR 编码器初始化失败可尝试另一种已声明的编码；CLI 的 auto / hevc / h264 用于诊断。HDR 仅接受 HEVC Main10。语言入口为直接切换按钮，不影响正在运行的 Session。
 
 真实高刷表现取决于采集内容、像素数、编解码能力与传输路径。不要通过扩大队列宣称性能提升；本机 3200×2136 对照中扩大队列没有提高吞吐，仅增加延迟，因此原生分辨率保留 4 帧上限。2400×1600 高刷采集的短测则受益于 6 帧额度，代价是小幅增加往返延迟；只对这一较低像素范围启用，120 fps 也不超过 6。见 RELEASE-0.5.md。
+
+## 0.6.0 输入与连接请求
+
+Mac 的开启触屏开关和直接触屏/触控板选择在连接中生效。TouchInputController 用锁建立同步授权边界；TouchGate 处理代次、绝对/相对坐标和释放。相对移动累加在本地锚点，避免事件投递延迟使光标回跳。开关默认关闭；App 的辅助功能权限及活动虚拟屏必须有效。
+
+Pad TouchGesture 独立识别单指、双指点击/滚动、三指拖动和四指滑动。TouchTapHistory 保留一次完成的轻点，让下一次附近接触在移动时开始单指拖动；时间和距离遵循 Android 双击阈值。TouchSurface 处理取消、指针 ID 和尺寸变化，并在取消或重新配置时清除轻点记录。TouchSender 使用最多 64 条的有界写队列，合并移动时累加相对位移，保留动作边界；拖动心跳使用零增量。系统取消会释放拖动，但无法阻止厂商系统先截获多指手势。
+
+ConnectRequestServer 处理独立认证的 PDR1 请求，Bonjour 仅用于发现。Pad 显式 Connect 优先选择 USB 视频，成功的无线请求使用来源地址更新 Mac；画质和输入授权保持在 Mac。GUI 的无线 Session 等待 Pad 的出站连接，8 秒没有移交才使用旧版直连。空闲 resume 轮询只接续已存在的等待槽，不能自行启动 Session。ACK 前预留等待槽，移交后使用全新 PDB1 握手。Pad 同步转移 socket 所有权，并以接收器空闲和 Surface lease 释放作为就绪条件；HDR 回退也遵循这个条件。Pad 请求和 UI 回调各自带代次，在暂停、Surface 重建及开始/结束连接时失效。PairStore 的代次锁防止撤销前的 ADB 准备重新保存授权。具体消息见 PROTOCOL.md。

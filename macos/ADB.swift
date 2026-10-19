@@ -28,7 +28,7 @@ enum ADB {
         guard devices.count == 1, let serial = devices.first else { throw BridgeError("请连接一台已授权 USB 调试的 Pad（当前检测到 \(devices.count) 台）。") }
         return serial
     }
-    static func prepare() throws -> (port: UInt16, serial: String, key: Data) {
+    static func prepare(pairingGeneration: Int) throws -> (port: UInt16, serial: String, key: Data) {
         let serial = try usbDevice()
         _ = try run(["-s", serial, "shell", "am", "start", "-n", package + "/.MainActivity"])
         var key = Data()
@@ -39,23 +39,37 @@ enum ADB {
         guard key.count == 32 else { throw BridgeError("请先安装并打开 Nextend Android 调试版。") }
         let output = try run(["-s", serial, "forward", "tcp:0", "tcp:49371"])
         guard let port = UInt16(String(data: output, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "") else { throw BridgeError("ADB 动态端口转发失败。") }
-        do { try PairStore.save(key) } catch { removeForward(serial: serial, port: port); throw error }
+        do { try PairStore.save(key, expectedGeneration: pairingGeneration) } catch { removeForward(serial: serial, port: port); throw error }
         return (port, serial, key)
     }
     static func removeForward(serial: String, port: UInt16) { _ = try? run(["-s", serial, "forward", "--remove", "tcp:\(port)"]) }
 }
 
 enum PairStore {
+    private static let lock = NSLock()
+    private static var epoch = 0
+    static var generation: Int { lock.lock(); defer { lock.unlock() }; return epoch }
     static var directory: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("PadBridge", isDirectory: true)
     }
-    static func save(_ key: Data) throws {
+    static func save(_ key: Data, expectedGeneration: Int) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard epoch == expectedGeneration else { throw BridgeError("配对已撤销，请通过 USB 重新连接。") }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let url = directory.appendingPathComponent("pairing.key")
         try key.write(to: url, options: [.atomic])
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        UserDefaults.standard.set(false, forKey: "pairingRevoked")
+    }
+    static func revoke() {
+        lock.lock(); defer { lock.unlock() }; epoch += 1
+        // Fail closed even if deleting the old file fails (e.g. read-only disk).
+        UserDefaults.standard.set(true, forKey: "pairingRevoked")
+        try? FileManager.default.removeItem(at: directory.appendingPathComponent("pairing.key"))
     }
     static func load() throws -> Data {
+        lock.lock(); defer { lock.unlock() }
+        guard !UserDefaults.standard.bool(forKey: "pairingRevoked") else { throw BridgeError("请先通过 USB 完成配对。") }
         guard let data = try? Data(contentsOf: directory.appendingPathComponent("pairing.key")), data.count == 32 else { throw BridgeError("请先通过 USB 完成配对。") }
         return data
     }

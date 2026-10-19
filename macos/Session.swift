@@ -16,6 +16,9 @@ struct SessionOptions {
     var requireHDR = false
     var fallbackReason: AppMessage?
     var requestedHDR = false
+    var touchEnabled = false
+    var trackpad = false
+    var padSettings = PadSettings()
 }
 
 // Lifecycle is on MainActor; active video state is confined to `queue`.
@@ -23,6 +26,9 @@ struct SessionOptions {
 // before queue teardown, so encoder/options never change during active use.
 final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     private var options: SessionOptions
+    private let reverseConnection: ReverseConnectionWaiter?
+    private let pairingGeneration = PairStore.generation
+    @MainActor private var pairingRevoked = false
     private let queue = DispatchQueue(label: "PadBridge.pipeline", qos: .userInteractive)
     private let sender = DispatchQueue(label: "PadBridge.writer", qos: .userInteractive)
     private var maxInFlight: Int { options.profile.frameCredits }
@@ -78,6 +84,14 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     private var lastRemoteNS: UInt64 = 0
     private var writeFailureReason: AppMessage? // pipeline queue; reader/watchdog owns terminal errors
     private var ready = false
+    private let touchInput = TouchInputController()
+    private var pairResetPending = false // pipeline queue
+    private var touchNegotiated = false // pipeline queue
+    @MainActor private var touchReady = false
+    @MainActor private var controlsReady = false
+    @MainActor private var trackpadRequested = false
+    @MainActor private var requestedSettings = PadSettings()
+    @MainActor private var touchRequested = false
     @MainActor private var startupTask: Task<Void, Never>?
     enum StatusKind { case information, preparing, connected, hdrVerified, metrics }
     var onStatus: ((AppMessage, StatusKind) -> Void)?
@@ -85,14 +99,61 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     var onPeerAddress: ((String) -> Void)?
     var onFinish: ((Bool) -> Void)?
     var onFallback: ((AppMessage, VirtualDisplay?) -> Void)?
-    init(options: SessionOptions, retainedDisplay: VirtualDisplay? = nil) {
-        self.options = options; self.display = retainedDisplay
+    var onPeerStats: (([String: Any]) -> Void)?
+    var onPairReset: (() -> Void)?
+    var onTouchUnavailable: ((AppMessage) -> Void)?
+    init(options: SessionOptions, retainedDisplay: VirtualDisplay? = nil, reverseConnection: ReverseConnectionWaiter? = nil) {
+        self.options = options; self.display = retainedDisplay; self.reverseConnection = reverseConnection
     }
     private var isStopping: Bool { stateLock.lock(); defer { stateLock.unlock() }; return stopping }
     private func status(_ text: AppMessage, kind: StatusKind = .information) { log(text.text); DispatchQueue.main.async { self.onStatus?(text, kind) } }
 
     @MainActor func launch() {
+        touchRequested = options.touchEnabled; trackpadRequested = options.trackpad; requestedSettings = options.padSettings
         startupTask = Task { await self.start() }
+    }
+    @MainActor func setTouchEnabled(_ enabled: Bool, trackpad: Bool? = nil) {
+        guard !pairingRevoked else { return }
+        touchRequested = enabled
+        if let trackpad { trackpadRequested = trackpad }
+        guard touchReady, !isStopping else { return }
+        guard queue.sync(execute: { touchNegotiated }) else {
+            if enabled { touchRequested = false; onTouchUnavailable?("请更新 Pad 端以使用触屏。") }
+            return
+        }
+        let command = touchInput.setEnabled(enabled, trackpad: trackpadRequested)
+        if enabled && command["enabled"] as? Bool != true {
+            touchRequested = false; onTouchUnavailable?("请在系统设置中允许 Nextend 使用辅助功能，然后开启触屏。")
+        }
+        sender.async { [weak self] in
+            guard let self, !self.isStopping, let channel = self.channel else { return }
+            do { try channel.sendJSON(command) } catch { self.writeFailed(error) }
+        }
+    }
+    @MainActor func updatePadSettings(_ value: PadSettings) {
+        requestedSettings = value
+        guard controlsReady, !isStopping else { return }
+        sendControl(value.json)
+    }
+    @MainActor func resetPairing() {
+        pairingRevoked = true
+        stateLock.lock(); fallbackCancelled = true; stateLock.unlock()
+        touchRequested = false; touchInput.close(); touchReady = false
+        // Revocation is local and immediate. A peer cannot veto it by withholding ACK.
+        PairStore.revoke(); onPairReset?()
+        guard !isStopping else { return }
+        guard controlsReady else { cancel(reason: "配对已撤销，请通过 USB 重新连接。"); return }
+        queue.sync { pairResetPending = true }; sendControl(["type": "reset-pairing"])
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self, !self.isStopping else { return }
+            if self.queue.sync(execute: { self.pairResetPending }) { self.cancel(reason: "配对已撤销，请通过 USB 重新连接。") }
+        }
+    }
+    private func sendControl(_ value: [String: Any]) {
+        sender.async { [weak self] in
+            guard let self, !self.isStopping, let channel = self.channel else { return }
+            do { try channel.sendJSON(value) } catch { self.writeFailed(error) }
+        }
     }
     @MainActor private func start() async {
         do {
@@ -102,13 +163,18 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
                 throw BridgeError("需要屏幕录制权限：点击“屏幕录制权限”，在系统设置中允许 Nextend，然后重启应用。")
             }
             status(options.wireless ? "正在连接加密无线…" : "正在建立 USB 转发并配对…")
-            let initial = options
+            let initial = options; let initialGeneration = pairingGeneration; let reverse = reverseConnection
             let connectTask = Task.detached { () -> (SecureChannel, (String, UInt16)?) in
                 try Task.checkCancellation()
                 if initial.wireless {
+                    if let socket = try reverse?.take() {
+                        try Task.checkCancellation()
+                        return (try SecureChannel(connected: socket, key: PairStore.load()), nil)
+                    }
+                    try Task.checkCancellation()
                     return (try SecureChannel(host: initial.host, port: 49371, key: PairStore.load(), interface: initial.interface), nil)
                 }
-                let setup = try ADB.prepare()
+                let setup = try ADB.prepare(pairingGeneration: initialGeneration)
                 do {
                     // Activity startup may precede Surface creation by a few hundred milliseconds.
                     var last: Error = BridgeError("Pad 未就绪。")
@@ -158,8 +224,11 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
                 }
             } else { encoder = try makeSDREncoder(codecs: codecs) }
             let p = options.profile
-            let config: [String: Any] = ["type": "config", "version": 1, "width": p.width, "height": p.height,
+            let supportsTouch = hello["touchVersion"] as? Int == 1
+            var config: [String: Any] = ["type": "config", "version": 1, "width": p.width, "height": p.height,
                 "fps": p.fps, "codec": p.codec, "color": p.color.rawValue, "bitDepth": p.color.bitDepth, "input": false]
+            if supportsTouch { config["touchVersion"] = 1 }
+            if hello["controlsVersion"] as? Int == 1 { config["controlsVersion"] = 1 }
             let response = try await Task.detached {
                 try channel.sendJSON(config); return try Self.json(channel.receive())
             }.value
@@ -171,6 +240,8 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
                 failHDR("Pad 未明确确认 HLG 10-bit 配置"); return
             }
             guard !isStopping else { channel.close(); return }
+            controlsReady = config["controlsVersion"] as? Int == 1 && response["controlsVersion"] as? Int == 1
+            queue.sync { touchNegotiated = supportsTouch && response["touchVersion"] as? Int == 1 }
             startControlLoop(channel)
             do {
                 if let inherited = display, !inherited.canReconfigureForSDR {
@@ -234,8 +305,14 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
                 lastTickEncoded = encoded; lastTickSource = sourceFrames; ready = true
             }
             try queue.sync { try startTimers() }
+            touchInput.attach(display: display!.id); touchReady = true
             status("\(p.width) × \(p.height) · \(p.fps) fps 目标 · \(p.codec.uppercased()) · \(p.color.title)", kind: .connected)
             if let reason = options.fallbackReason { status("已回退 SDR：\(reason)") }
+            // The status callbacks above are queued on main. Report a missing
+            // touch capability after them so the reason stays visible.
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }; self.setTouchEnabled(self.touchRequested); self.updatePadSettings(self.requestedSettings)
+            }
         } catch { stop(reason: error.appMessage, success: false) }
     }
     private func selectSDR(_ reason: AppMessage) throws {
@@ -302,7 +379,9 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
             do {
                 while let self, !self.isStopping {
                     let message = try Self.json(channel.receive())
-                    self.queue.async { self.handle(message) }
+                    // Bound reader work; a peer cannot queue unlimited input
+                    // ahead of the local off switch or teardown.
+                    self.queue.sync { self.handle(message) }
                 }
             } catch {
                 // Preserve arrival order: an HDR rejection must be handled
@@ -326,6 +405,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
             timer.setEventHandler { [weak self] in
                 guard let self, !self.isStopping else { return }
                 let now = monotonicNS()
+                self.touchInput.checkLiveness()
                 if now - self.lastRemoteNS > 6_000_000_000 {
                     self.stop(reason: self.writeFailureReason ?? "控制连接超时，已释放虚拟屏。可重新连接。", success: false); return
                 }
@@ -430,6 +510,15 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         guard !isStopping else { return }
         lastRemoteNS = monotonicNS()
         switch json["type"] as? String {
+        case "touch":
+            guard touchNegotiated else { stop(reason: "拒绝未协商的触屏消息。", success: false); return }
+            do { try touchInput.receive(json) } catch { stop(reason: error.appMessage, success: false) }
+        case "touch-state":
+            guard touchNegotiated else { stop(reason: "拒绝未协商的触屏消息。", success: false); return }
+        case "pair-reset":
+            guard pairResetPending else { stop(reason: "拒绝未知控制消息。", success: false); return }
+            pairResetPending = false
+            stop(reason: "配对已撤销，请通过 USB 重新连接。", success: true)
         case "hdr-error": failHDR(AppMessage(raw: json["message"] as? String ?? "Pad HDR output failed"))
         case "ack":
             guard let seq = (json["seq"] as? NSNumber)?.uint64Value, let start = pending.removeValue(forKey: seq) else { stop(reason: "Pad 返回无效帧确认。", success: false); return }
@@ -444,6 +533,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         case "keyframe": forceKeyframe = true
         case "stats":
             remote = json
+            DispatchQueue.main.async { self.onPeerStats?(json) }
             if let format = json["videoFormat"] as? [String: Any] {
                 decoderColor = format
                 if options.profile.color == .hlg, format["color"] as? String == VideoColor.hlg.rawValue,
@@ -454,7 +544,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
             }
         case "pong": break
         case "error": stop(reason: AppMessage(raw: json["message"] as? String ?? "Pad decoder failed."), success: false)
-        default: stop(reason: "拒绝未知或输入回传消息。", success: false)
+        default: stop(reason: "拒绝未知控制消息。", success: false)
         }
     }
     private func sample() {
@@ -507,6 +597,8 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         stateLock.lock()
         if stopping { stateLock.unlock(); return }
         stopping = true; stateLock.unlock()
+        reverseConnection?.cancel()
+        touchInput.close()
         channel?.close()
         Task { @MainActor in
             self.display?.suspendEnforcement()

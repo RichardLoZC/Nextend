@@ -90,6 +90,7 @@ class VideoDecoder(
                 }
             }, handler)
             codec.configure(format, surface, null, 0)
+            codec.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT)
             codec.start()
         } catch (e: Exception) { codec.release(); thread.quitSafely(); throw e }
     }

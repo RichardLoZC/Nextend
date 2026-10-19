@@ -1,12 +1,20 @@
 import AppKit
+import ApplicationServices
 
-@MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
+@MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var window: NSWindow!
     var session: Session?
     private let statusLabel = glassText("", size: 13, muted: true)
     private let rate = NSSegmentedControl(labels: ["60 fps", "90 fps", "120 fps"], trackingMode: .selectOne, target: nil, action: nil)
     private let resolution = NSPopUpButton()
     private let hdr = NSSwitch()
+    private let touch = NSSwitch()
+    private let inputMode = NSSegmentedControl(labels: ["", ""], trackingMode: .selectOne, target: nil, action: nil)
+    private var padSettings = PadSettings()
+    private var padPanel: PadSettingsPanel?
+    private var peerStats: [String: Any] = [:]
+    private var requestServer: ConnectRequestServer?
+    private var reverseConnection: ReverseConnectionWaiter?
     private let colorLabel = glassText("SDR · BT.709", size: 12, weight: .medium)
     private let transport = NSSegmentedControl(labels: ["", ""], trackingMode: .selectOne, target: nil, action: nil)
     private let language = GlassActionButton()
@@ -24,6 +32,7 @@ import AppKit
     private enum ConnectionState { case idle, connecting, connected, finished(Bool) }
     private var connectionState: ConnectionState = .idle
     private var lastMessage: AppMessage = "用 USB 连接并打开 Nextend，即可开始。"
+    private var connectionMessage: AppMessage = "用 USB 连接并打开 Nextend，即可开始。"
     private var activeWireless = false
     private var outputColor = VideoColor.sdr
     private var hdrVerified = false
@@ -56,6 +65,22 @@ import AppKit
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem?.button?.image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "Nextend")
         refreshLanguage()
+        requestServer = ConnectRequestServer { [weak self] peer, command in
+            guard let self, !self.restartRequired, !self.quitting else { return .rejected }
+            if command == "resume" {
+                guard peer != "127.0.0.1", self.session != nil, let pending = self.reverseConnection, pending.isWaiting else { return .rejected }
+                return ConnectRequestDecision(accepted: true, reverse: pending)
+            }
+            guard self.session == nil else { return .rejected }
+            var options = self.uiOptions(synthetic: false)
+            // The Pad tries USB first. The authenticated request path selects video too.
+            options.wireless = peer != "127.0.0.1"
+            self.transport.selectedSegment = options.wireless ? 1 : 0; self.transportChanged()
+            if options.wireless { options.host = peer; self.ip.stringValue = peer }
+            self.start(options, cli: false)
+            return ConnectRequestDecision(accepted: true, reverse: self.reverseConnection)
+        }
+        requestServer?.start()
     }
     private func cliOptions() throws -> SessionOptions {
         var options = SessionOptions(); options.synthetic = arguments.contains("--benchmark")
@@ -81,6 +106,7 @@ import AppKit
     private func makeWindow() {
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 940, height: 690), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "Nextend"; window.center(); window.isReleasedWhenClosed = false
+        window.delegate = self
         window.minSize = NSSize(width: 880, height: 710)
         window.appearance = NSAppearance(named: .aqua); window.titlebarAppearsTransparent = true
         let background = GlassBackdropView(); window.contentView = background
@@ -136,21 +162,26 @@ import AppKit
         hdr.state = .off; hdr.target = self; hdr.action = #selector(hdrChanged)
         let hdrInfo = NSButton(title: "HDR", target: self, action: #selector(showHDRInfo)); hdrInfo.bezelStyle = .inline
         let colorRow = glassStack([colorLabel, NSView(), hdrInfo, hdr], vertical: false, spacing: 8)
+        touch.state = .off; touch.target = self; touch.action = #selector(touchChanged)
+        let touchRow = glassStack([label("开启触屏", "Enable touch", size: 13), NSView(), touch], vertical: false, spacing: 8)
+        inputMode.selectedSegment = 0; inputMode.segmentStyle = .rounded
+        inputMode.target = self; inputMode.action = #selector(touchChanged)
         connectButton = action("连接", "Connect", #selector(connect), primary: true); connectButton.keyEquivalent = "\r"
         connectButton.heightAnchor.constraint(equalToConstant: 45).isActive = true
         let spacer = NSView(); spacer.heightAnchor.constraint(greaterThanOrEqualToConstant: 12).isActive = true
         let rightContents = fill(glassStack([
             label("连接与画质", "Connection & quality", size: 18, weight: .semibold), transport,
             group("分辨率", "Resolution", resolution), group("目标帧率", "Target frame rate", rate),
-            addresses, colorRow, spacer, connectButton
-        ], spacing: 20))
+            addresses, colorRow, touchRow, inputMode, spacer, connectButton
+        ], spacing: 15))
         let right = GlassSurface(); right.embed(rightContents); right.widthAnchor.constraint(equalToConstant: 338).isActive = true
         let main = glassStack([left, right], vertical: false, spacing: 18)
         NSLayoutConstraint.activate([left.heightAnchor.constraint(equalTo: main.heightAnchor), right.heightAnchor.constraint(equalTo: main.heightAnchor), left.widthAnchor.constraint(equalTo: main.widthAnchor, constant: -356)])
         main.setContentHuggingPriority(.defaultLow, for: .vertical)
         let permission = action("屏幕录制权限", "Screen recording", #selector(permission))
         let arrangement = action("排列显示器", "Arrange displays", #selector(arrangement))
-        let footer = glassStack([permission, arrangement, NSView()], vertical: false, spacing: 10)
+        let pad = action("Pad 设置", "Pad settings", #selector(showPadSettings))
+        let footer = glassStack([permission, arrangement, pad, NSView()], vertical: false, spacing: 10)
         footer.heightAnchor.constraint(equalToConstant: 38).isActive = true
         let root = fill(glassStack([header, main, footer], spacing: 18))
         root.translatesAutoresizingMaskIntoConstraints = false; background.addSubview(root)
@@ -158,7 +189,7 @@ import AppKit
         settingControls = [rate, transport, resolution, ip, interface, hdr]
         refreshLanguage(); showWindow()
     }
-    @objc private func languageChanged() { AppLanguage.select(english: !AppLanguage.english); refreshLanguage() }
+    @objc private func languageChanged() { AppLanguage.select(english: !AppLanguage.english); padPanel?.close(); padPanel = nil; refreshLanguage(); session?.updatePadSettings(padSettings) }
     private func refreshLanguage() {
         localizedBindings.forEach { $0() }
         language.title = AppLanguage.english ? "中文" : "English"; language.needsDisplay = true
@@ -167,6 +198,8 @@ import AppKit
         rate.toolTip = L("60 fps 已验证；90 / 120 fps 为实验档，实际帧率取决于设备与网络。", "60 fps has been tested. 90 / 120 fps are experimental; actual rates depend on the device and network.")
         ip.placeholderString = L("Pad 的 IPv4 地址", "Pad IPv4 address")
         hdr.setAccessibilityLabel(L("启用 HDR", "Enable HDR"))
+        inputMode.setLabel(L("直接触屏", "Touchscreen"), forSegment: 0); inputMode.setLabel(L("触控板", "Trackpad"), forSegment: 1)
+        touch.setAccessibilityLabel(L("开启触屏", "Enable touch"))
         hdr.toolTip = L("HEVC Main10 / HLG；不可用时回退 SDR。", "HEVC Main10 / HLG; falls back to SDR if unavailable.")
         renderConnection(); rebuildMenus()
     }
@@ -199,13 +232,25 @@ import AppKit
         for (name, selector) in [(L("桌面采集测试 · 30 秒", "Desktop capture test · 30 s"), #selector(desktopTest)), (L("合成测试 · 30 秒", "Synthetic test · 30 s"), #selector(testPattern))] {
             let test = item(name, selector); test.isEnabled = session == nil && !restartRequired; tests.submenu?.addItem(test)
         }
-        menu.addItem(tests); menu.addItem(.separator())
+        menu.addItem(tests)
+        menu.addItem(item(L("Pad 设置", "Pad settings"), #selector(showPadSettings)))
+        let reset = item(L("重新配对", "Pair again"), #selector(resetPairing)); reset.isEnabled = session != nil; menu.addItem(reset)
+        menu.addItem(.separator())
         menu.addItem(item(L("退出 Nextend", "Quit Nextend"), #selector(quit), key: "q"))
         statusItem?.menu = menu
         let root = NSMenu(); let appItem = NSMenuItem(); root.addItem(appItem)
         appItem.submenu = menu.copy() as? NSMenu; NSApp.mainMenu = root
     }
-    @objc private func showWindow() { window?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
+    @objc private func showWindow() {
+        NSApp.setActivationPolicy(.regular)
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+    func windowWillClose(_ notification: Notification) {
+        guard let closedWindow = notification.object as? NSWindow, closedWindow === window else { return }
+        // Only presentation changes. The status item and active session stay alive.
+        NSApp.setActivationPolicy(.accessory)
+    }
     @objc private func quit() { NSApp.terminate(nil) }
     @objc private func transportChanged() { wirelessFields?.isHidden = transport.selectedSegment == 0 }
     @objc private func hdrChanged() { renderConnection() }
@@ -216,6 +261,8 @@ import AppKit
     }
     private func uiOptions(synthetic: Bool) -> SessionOptions {
         var options = SessionOptions(); options.synthetic = synthetic; options.seconds = synthetic ? 30 : 0
+        options.touchEnabled = touch.state == .on && !synthetic
+        options.trackpad = inputMode.selectedSegment == 1; options.padSettings = padSettings
         options.profile.fps = [60, 90, 120][rate.selectedSegment]
         options.requestedHDR = hdr.state == .on; options.profile.color = options.requestedHDR ? .hlg : .sdr
         if resolution.indexOfSelectedItem == 1 { options.profile.width = 2400; options.profile.height = 1600 }
@@ -228,6 +275,35 @@ import AppKit
     @objc private func testPattern() { start(uiOptions(synthetic: true), cli: false) }
     @objc private func desktopTest() { var options = uiOptions(synthetic: false); options.capturePattern = true; options.seconds = 30; start(options, cli: false) }
     @objc private func disconnect() { session?.cancel() }
+    @objc private func touchChanged() {
+        if touch.state == .on && !AXIsProcessTrusted() {
+            touch.state = .off
+            _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
+            lastMessage = "请在系统设置中允许 Nextend 使用辅助功能，然后开启触屏。"; renderConnection()
+        }
+        session?.setTouchEnabled(touch.state == .on, trackpad: inputMode.selectedSegment == 1)
+        if touch.state == .on && AXIsProcessTrusted() { lastMessage = connectionMessage; renderConnection() }
+    }
+    @objc private func showPadSettings() {
+        showWindow()
+        if padPanel == nil { padPanel = PadSettingsPanel(value: padSettings) { [weak self] value in self?.padSettings = value; self?.session?.updatePadSettings(value) } }
+        updatePeerStats(); padPanel?.showWindow(nil); padPanel?.window?.center()
+    }
+    private func updatePeerStats() {
+        func n(_ key: String) -> String { (peerStats[key] as? Double).map { String(format: "%.1f", $0) } ?? "—" }
+        padPanel?.diagnostics.stringValue = L("呈现", "Rendered") + " \(n("renderFps")) fps · " + L("面板", "Display") + " \(n("displayHz")) Hz\n" + L("解码", "Decoded") + " \(n("decodeFps")) fps · " + L("丢弃", "Dropped") + " \(n("dropped")) · " + L("温控", "Thermal") + " \(n("thermal"))"
+    }
+    @objc private func resetPairing() {
+        guard session != nil else { return }
+        showWindow(); let alert = NSAlert(); alert.messageText = L("重新配对？", "Pair again?")
+        alert.informativeText = L("断开连接并撤销配对。之后需要通过 USB 重新连接。", "Disconnect and revoke pairing. Reconnect with USB afterwards.")
+        alert.addButton(withTitle: L("重新配对", "Pair again")); alert.addButton(withTitle: L("取消", "Cancel"))
+        alert.beginSheetModal(for: window) { [weak self] result in
+            guard result == .alertFirstButtonReturn else { return }
+            self?.touch.state = .off
+            if let session = self?.session { session.resetPairing() } else { PairStore.revoke() }
+        }
+    }
     @objc private func sleeping() { session?.cancel(reason: "Mac 已进入睡眠，虚拟屏已释放；唤醒后点击连接恢复。") }
     @objc private func permission() {
         _ = CGRequestScreenCaptureAccess()
@@ -237,7 +313,8 @@ import AppKit
     @objc private func arrangement() { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Displays-Settings.extension")!) }
     private func start(_ options: SessionOptions, cli: Bool, retainedDisplay: VirtualDisplay? = nil) {
         guard session == nil, !restartRequired else { return }
-        let session = Session(options: options, retainedDisplay: retainedDisplay); self.session = session
+        reverseConnection = options.wireless && !cli ? ReverseConnectionWaiter() : nil
+        let session = Session(options: options, retainedDisplay: retainedDisplay, reverseConnection: reverseConnection); self.session = session
         activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical], reason: "Nextend desktop streaming")
         connectionState = .connecting; activeWireless = options.wireless; outputColor = options.profile.color; hdrVerified = false; fallbackUsed = options.fallbackReason != nil
         connectButton?.isEnabled = true; settingControls.forEach { $0.isEnabled = false }
@@ -246,11 +323,22 @@ import AppKit
             guard let self, let session, self.session === session else { return }
             self.ip.stringValue = address; UserDefaults.standard.set(address, forKey: "padIP")
         }
+        session.onPairReset = { [weak self] in
+            self?.touch.state = .off
+        }
+        session.onPeerStats = { [weak self, weak session] stats in
+            guard let self, let session, self.session === session else { return }
+            self.peerStats = stats; self.updatePeerStats()
+        }
+        session.onTouchUnavailable = { [weak self, weak session] message in
+            guard let self, let session, self.session === session else { return }
+            self.touch.state = .off; self.lastMessage = message; self.renderConnection()
+        }
         session.onStatus = { [weak self, weak session] message, kind in
             guard let self, let session, self.session === session else { return }
             switch kind {
             case .metrics: return
-            case .connected: self.connectionState = .connected; self.deviceArt.connected = true; self.rebuildMenus()
+            case .connected: self.connectionMessage = message; self.connectionState = .connected; self.deviceArt.connected = true; self.rebuildMenus()
             case .hdrVerified: self.hdrVerified = true
             default: break
             }
@@ -276,6 +364,8 @@ import AppKit
             guard let self else { return }; self.session = nil; self.endActivity()
             if self.quitting { NSApp.terminate(nil); return }
             var fallback = options; fallback.profile.color = .sdr; fallback.fallbackReason = reason
+            fallback.touchEnabled = !cli && self.touch.state == .on
+            fallback.trackpad = self.inputMode.selectedSegment == 1; fallback.padSettings = self.padSettings
             self.start(fallback, cli: cli, retainedDisplay: retainedDisplay)
         }
         session.launch()
@@ -304,6 +394,7 @@ import AppKit
         // Cancel this attempt and terminate after asynchronous display cleanup.
         quitting = true; session.cancel(); return .terminateCancel
     }
+    func applicationWillTerminate(_ notification: Notification) { requestServer?.close() }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag { showWindow() }; return true

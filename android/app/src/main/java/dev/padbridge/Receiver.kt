@@ -15,7 +15,7 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 class Receiver(
-    private val address: String, private val key: ByteArray, private val surface: Surface,
+    private val address: String, private val key: () -> ByteArray, private val surface: Surface,
     private val panelWidth: Int, private val panelHeight: Int,
     private val hdrTypes: IntArray,
     private val lease: SessionLease,
@@ -24,6 +24,8 @@ class Receiver(
     private val status: (UiText, Boolean) -> Unit,
     private val stats: (RenderStats) -> Unit,
     private val mode: (Int) -> Unit, private val refresh: () -> Float,
+    private val touchMode: (TouchSender, TouchMode) -> Unit,
+    private val settings: (JSONObject) -> Unit, private val resetPairing: () -> Unit, private val pairingChanged: () -> Unit,
     private val thermal: () -> Int
 ) : AutoCloseable {
     @Volatile private var running = true
@@ -31,6 +33,7 @@ class Receiver(
     @Volatile private var socket: Socket? = null
     private val lifecycleLock = Any()
     private val worker = Thread({ listen() }, "PadBridge-receiver")
+    private var reverseWorker: Thread? = null
     fun start() { worker.start() }
     private fun listen() {
         try {
@@ -41,42 +44,60 @@ class Receiver(
             listening(true)
             while (running) {
                 val client = try { listener.accept() } catch (_: SocketTimeoutException) { continue }
-                synchronized(lifecycleLock) { if (running) socket = client else client.close() }
-                if (!running) { client.close(); break }
-                var ownsSession = false
-                var releaseDelegated = false
-                var ended = UiText("连接已结束", "Disconnected")
-                try {
-                    client.use {
-                        // Never let an unauthenticated socket acquire the shared Surface.
-                        val secure = SecureChannel(it, key)
-                        if (!running) return@use
-                        ownsSession = lease.acquire(client)
-                        if (!ownsSession) {
-                            secure.send(byteArrayOf(1) + JSONObject().put("type", "busy").toString().toByteArray())
-                            return@use
-                        }
-                        if (running) {
-                            releaseDelegated = true
-                            serve(secure) { lease.release(client) }
-                        }
-                    }
-                } catch (e: Exception) {
-                    ended = UiText("连接结束：${e.message}", "Connection ended: ${e.message}")
-                } finally {
-                    // serve() closes its decoder before another transport can enter.
-                    if (ownsSession) {
-                        if (!releaseDelegated) lease.release(client)
-                        if (running) status(ended, false)
-                    }
-                    synchronized(lifecycleLock) { if (socket === client) socket = null }
+                val claimed = synchronized(lifecycleLock) {
+                    if (running && socket == null) { socket = client; true } else false
                 }
+                if (!claimed) { client.close(); continue }
+                handle(client)
             }
         } catch (e: Exception) { if (running) android.util.Log.w("PadBridge", "Listener unavailable", e) }
         finally { runCatching { server?.close() }; if (running) listening(false) }
     }
+    /** Takes ownership only on success; no second transport may replace an active socket. */
+    fun canAcceptReverse(): Boolean = synchronized(lifecycleLock) { running && socket == null && lease.isAvailable() }
+    fun acceptReverse(client: Socket, pairedKey: ByteArray): Boolean = synchronized(lifecycleLock) {
+        if (!running || socket != null || !lease.isAvailable()) return@synchronized false
+        socket = client
+        reverseWorker = Thread({ handle(client, pairedKey) }, "Nextend-reverse-video").also { it.start() }
+        true
+    }
+    private fun handle(client: Socket, authenticatedKey: ByteArray? = null) {
+        var ownsSession = false
+        var releaseDelegated = false
+        var ended = UiText("连接已结束", "Disconnected")
+        try {
+            client.use {
+                // Never let an unauthenticated socket acquire the shared Surface.
+                val pairedKey = authenticatedKey ?: key()
+                require(java.security.MessageDigest.isEqual(pairedKey, key())) { "Pairing changed" }
+                val secure = SecureChannel(it, pairedKey)
+                require(java.security.MessageDigest.isEqual(pairedKey, key())) { "Pairing changed" }
+                if (!running) return@use
+                ownsSession = lease.acquire(client)
+                if (!ownsSession) {
+                    secure.send(byteArrayOf(1) + JSONObject().put("type", "busy").toString().toByteArray())
+                    return@use
+                }
+                if (running) {
+                    require(java.security.MessageDigest.isEqual(pairedKey, key())) { "Pairing changed" }
+                    releaseDelegated = true
+                    serve(secure) { lease.release(client) }
+                }
+            }
+        } catch (e: Exception) {
+            ended = UiText("连接结束：${e.message}", "Connection ended: ${e.message}")
+        } finally {
+            // serve() closes its decoder before another transport can enter.
+            if (ownsSession) {
+                if (!releaseDelegated) lease.release(client)
+                if (running) status(ended, false)
+            }
+            synchronized(lifecycleLock) { if (socket === client) socket = null }
+        }
+    }
     private fun serve(channel: SecureChannel, releaseSession: () -> Unit) {
         var decoder: VideoDecoder? = null
+        var touch: TouchSender? = null
         val scheduler = Executors.newSingleThreadScheduledExecutor()
         val rendered = AtomicLong(0); val decoded = AtomicLong(0); val dropped = AtomicLong(0); val totalReceived = AtomicLong(0)
         val renderDelayBits = AtomicLong(0)
@@ -86,7 +107,7 @@ class Receiver(
         fun send(value: JSONObject) { channel.send(byteArrayOf(1) + value.toString().toByteArray()) }
         try {
             send(JSONObject().put("type", "hello").put("version", 1).put("width", panelWidth).put("height", panelHeight)
-                .put("input", false).put("refresh", refresh()).put("hdrTypes", JSONArray(hdrTypes.toList()))
+                .put("input", false).put("touchVersion", 1).put("controlsVersion", 1).put("refresh", refresh()).put("hdrTypes", JSONArray(hdrTypes.toList()))
                 .put("wifiAddress", wifiAddress()))
             val initial = channel.receive()
             require(initial.firstOrNull() == 1.toByte())
@@ -114,6 +135,8 @@ class Receiver(
             color = VideoColor.negotiate(config.getString("color"), encoding, hlgSupported)
             require(config.optInt("bitDepth", 8) == color.bitDepth)
             require(!config.optBoolean("input", false))
+            val controlsNegotiated = config.optInt("controlsVersion", 0) == 1
+            val touchNegotiated = config.optInt("touchVersion", 0) == 1
             mode(fps)
             surface.setFrameRate(fps.toFloat(), Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
             if (!running) return
@@ -130,9 +153,10 @@ class Receiver(
                     status(UiText("解码停止：$message", "Decoder stopped: $message"), false); channel.close()
                 })
             send(JSONObject().put("type", "ready").put("decoder", decoder.name).put("width", width).put("height", height)
-                .put("color", color.wire).put("bitDepth", color.bitDepth))
+                .put("color", color.wire).put("bitDepth", color.bitDepth).also { if (touchNegotiated) it.put("touchVersion", 1); if (controlsNegotiated) it.put("controlsVersion", 1) })
             val summary = UiText("$width × $height · $fps fps 目标 · ${encoding.uppercase()} · ${color.title}", "$width × $height · Target $fps fps · ${encoding.uppercase()} · ${color.title}")
             status(summary, true)
+            if (touchNegotiated) touch = TouchSender(width, height, ::send) { channel.close() }
             scheduler.scheduleAtFixedRate({
                 val now = System.nanoTime(); val count = rendered.get(); val decodedCount = decoded.get()
                 val rate = (count - lastRendered) * 1e9 / (now - lastTime)
@@ -157,6 +181,17 @@ class Receiver(
                         val json = JSONObject(String(body, 1, body.size - 1))
                         when (json.getString("type")) {
                             "ping" -> send(JSONObject().put("type", "pong"))
+                            "touch-mode" -> {
+                                val endpoint = touch ?: error("Touch was not negotiated")
+                                touchMode(endpoint, endpoint.setMode(json))
+                            }
+                            "pad-settings" -> { require(controlsNegotiated); settings(PadPreferences.validate(json)) }
+                            "reset-pairing" -> {
+                                require(controlsNegotiated)
+                                resetPairing()
+                                try { send(JSONObject().put("type", "pair-reset")) } finally { pairingChanged() }
+                                return
+                            }
                             "stop" -> return
                             else -> error("Unsupported control message")
                         }
@@ -175,7 +210,7 @@ class Receiver(
             runCatching { send(JSONObject().put("type", if (color == VideoColor.HLG) "hdr-error" else "error").put("message", e.message ?: "Receive failed")) }
             throw e
         } finally {
-            channel.close(); scheduler.shutdownNow()
+            touch?.close(); channel.close(); scheduler.shutdownNow()
             runCatching { surface.setFrameRate(0f, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT) }
             // If vendor teardown exceeds our UI wait, retain the lease until
             // the codec handler actually releases the old decoder.
@@ -185,6 +220,8 @@ class Receiver(
     override fun close() {
         synchronized(lifecycleLock) { running = false; runCatching { socket?.close() }; runCatching { server?.close() } }
         if (Thread.currentThread() !== worker) worker.join(2500)
+        val reverse = synchronized(lifecycleLock) { reverseWorker }
+        if (Thread.currentThread() !== reverse) reverse?.join(2500)
     }
     companion object { const val PORT = 49371 }
 }
