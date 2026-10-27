@@ -2,6 +2,12 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$ROOT/outputs/Nextend.app"
+# This is a generated bundle, never the installed application. Start fresh so
+# cloud-provider history and previous signing resources cannot enter a release.
+if [ -d "$APP" ]; then
+  PREVIOUS="$ROOT/work/macos-bundle-$(date +%s)-$$"
+  mv "$APP" "$PREVIOUS"
+fi
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$ROOT/work/swift-cache"
 xcrun swiftc -O -whole-module-optimization -swift-version 5 -target arm64-apple-macos14.0 \
   -module-cache-path "$ROOT/work/swift-cache" \
@@ -19,8 +25,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleDisplayName</key><string>Nextend</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.6.0</string>
-<key>CFBundleVersion</key><string>9</string>
+<key>CFBundleShortVersionString</key><string>0.8.1</string>
+<key>CFBundleVersion</key><string>13</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSBonjourServices</key><array><string>_nextend._tcp</string></array>
@@ -32,6 +38,6 @@ PLIST
 # lets unrelated local code impersonate this app's authorization identity.
 # Changed builds may need screen-recording authorization again.
 cp "$ROOT/assets/brand/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
-cp -R "$ROOT/macos/Resources/" "$APP/Contents/Resources/"
-codesign --force --sign - --identifier dev.padbridge.mac "$APP"
+rsync -r --exclude='.duckversions' "$ROOT/macos/Resources/" "$APP/Contents/Resources/"
+python3 "$ROOT/ops/mac_bundle.py" "$APP"
 printf '%s\n' "$APP"

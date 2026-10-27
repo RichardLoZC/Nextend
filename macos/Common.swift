@@ -60,6 +60,26 @@ enum CodecPreference: String {
     }
 }
 
+/// A cached recovery frame must survive backpressure and encoder drops on a static desktop.
+struct CachedFrameReplay {
+    private(set) var needed = false
+    private var sequence: UInt64?
+    mutating func request() { needed = true }
+    func canSubmit(visible: Bool, credits: Int, hasFrame: Bool) -> Bool { needed && visible && credits > 0 && hasFrame }
+    mutating func submitted(_ sequence: UInt64) {
+        guard needed else { return }
+        needed = false; self.sequence = sequence
+    }
+    mutating func acknowledged(_ sequence: UInt64, decoded: Bool) {
+        guard self.sequence == sequence else { return }
+        self.sequence = nil
+        if !decoded { needed = true }
+    }
+    mutating func dropped(_ sequence: UInt64) {
+        if self.sequence == sequence { self.sequence = nil; needed = true }
+    }
+}
+
 struct EncoderRecovery {
     private(set) var dropped: UInt64 = 0
     private var firstDropNS: UInt64?

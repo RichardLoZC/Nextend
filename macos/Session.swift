@@ -48,7 +48,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     private var hdrConverter: HDRConverter?
     @MainActor private var hdrCaptureStarted = false
     private let hdrLifetime = HDRCaptureLifetime()
-    private(set) var needsRestart = false
+    let cleanupRecovery = ConnectionRecovery()
     private var display: VirtualDisplay?
     private var capturePattern: CapturePattern?
     private var tick: DispatchSourceTimer?
@@ -58,6 +58,11 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     private var nextSequence: UInt64 = 0
     private var pending: [UInt64: UInt64] = [:]
     private var forceKeyframe = true
+    private var viewerVisible = true // optional Pad stats field; legacy receivers stay visible
+    private var latestBuffer: CVPixelBuffer?
+    private var cachedReplay = CachedFrameReplay()
+    private var visibleSinceNS: UInt64?
+    private var visibleDurationNS: UInt64 = 0
     private var captured: UInt64 = 0
     private var sourceFrames: UInt64 = 0
     private var lastTickSource: UInt64 = 0
@@ -91,6 +96,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     @MainActor private var controlsReady = false
     @MainActor private var trackpadRequested = false
     @MainActor private var requestedSettings = PadSettings()
+    @MainActor private var notchController: PadNotchController?
     @MainActor private var touchRequested = false
     @MainActor private var startupTask: Task<Void, Never>?
     enum StatusKind { case information, preparing, connected, hdrVerified, metrics }
@@ -132,6 +138,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     }
     @MainActor func updatePadSettings(_ value: PadSettings) {
         requestedSettings = value
+        notchController?.update(value.notch)
         guard controlsReady, !isStopping else { return }
         sendControl(value.json)
     }
@@ -164,6 +171,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
             }
             status(options.wireless ? "正在连接加密无线…" : "正在建立 USB 转发并配对…")
             let initial = options; let initialGeneration = pairingGeneration; let reverse = reverseConnection
+            let adbCancellation = ADBCancellation()
             let connectTask = Task.detached { () -> (SecureChannel, (String, UInt16)?) in
                 try Task.checkCancellation()
                 if initial.wireless {
@@ -174,7 +182,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
                     try Task.checkCancellation()
                     return (try SecureChannel(host: initial.host, port: 49371, key: PairStore.load(), interface: initial.interface), nil)
                 }
-                let setup = try ADB.prepare(pairingGeneration: initialGeneration)
+                let setup = try ADB.prepare(pairingGeneration: initialGeneration, cancellation: adbCancellation)
                 do {
                     // Activity startup may precede Surface creation by a few hundred milliseconds.
                     var last: Error = BridgeError("Pad 未就绪。")
@@ -186,7 +194,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
                     throw last
                 } catch { ADB.removeForward(serial: setup.serial, port: setup.port); throw error }
             }
-            let connection = try await withTaskCancellationHandler(operation: { try await connectTask.value }, onCancel: { connectTask.cancel() })
+            let connection = try await withTaskCancellationHandler(operation: { try await connectTask.value }, onCancel: { adbCancellation.cancel(); connectTask.cancel() })
             let channel = connection.0
             if let value = connection.1 { forward = (value.0, value.1) }
             self.channel = channel
@@ -247,7 +255,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
                 if let inherited = display, !inherited.canReconfigureForSDR {
                     display = nil
                     guard await inherited.closeAndWait() else {
-                        needsRestart = true
+                        cleanupRecovery.waitUntil { inherited.isReleased }
                         throw BridgeError("HDR 辅助进程未完成清理，无法启动 SDR。")
                     }
                     try Task.checkCancellation()
@@ -302,10 +310,15 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
             guard !isStopping else { return }
             queue.sync {
                 startedNS = monotonicNS(); lastTickNS = startedNS
+                visibleSinceNS = viewerVisible ? startedNS : nil
                 lastTickEncoded = encoded; lastTickSource = sourceFrames; ready = true
             }
             try queue.sync { try startTimers() }
             touchInput.attach(display: display!.id); touchReady = true
+            if !options.synthetic {
+                notchController = PadNotchController(displayID: display!.id)
+                notchController?.update(requestedSettings.notch)
+            }
             status("\(p.width) × \(p.height) · \(p.fps) fps 目标 · \(p.codec.uppercased()) · \(p.color.title)", kind: .connected)
             if let reason = options.fallbackReason { status("已回退 SDR：\(reason)") }
             // The status callbacks above are queued on main. Report a missing
@@ -458,6 +471,8 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
     func stream(_ stream: SCStream, didStopWithError error: Error) { stop(reason: "屏幕采集停止：\(error.appMessage)", success: false) }
     private func submit(_ buffer: CVPixelBuffer, capturedNS: UInt64) {
         guard active else { return }
+        latestBuffer = buffer
+        guard viewerVisible else { return }
         captured += 1
         if captureEvidence.isEmpty || (options.capturePattern && captured == 60) {
             captureEvidence = Self.describeBuffer(buffer)
@@ -472,9 +487,15 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         // An additional wall-clock gate drops valid frames after timer jitter.
         guard pending.count < maxInFlight else { skipped += 1; return }
         nextSequence += 1; lastSubmitted = capturedNS; pending[nextSequence] = capturedNS
-        let force = forceKeyframe; forceKeyframe = false
+        let force = forceKeyframe || cachedReplay.needed; forceKeyframe = false
+        cachedReplay.submitted(nextSequence)
         do { try encoder?.encode(buffer, sequence: nextSequence, capturedNS: capturedNS, forceKeyframe: force) }
         catch { if options.profile.color == .hlg { failHDR(error.appMessage) } else { stop(reason: error.appMessage, success: false) } }
+    }
+    private func replayLatestIfNeeded() {
+        guard active, cachedReplay.canSubmit(visible: viewerVisible, credits: maxInFlight - pending.count, hasFrame: latestBuffer != nil),
+              let latestBuffer else { return }
+        submit(latestBuffer, capturedNS: monotonicNS())
     }
     private func didEncode(_ result: Result<EncoderOutput, Error>) {
         guard active else { return }
@@ -483,6 +504,9 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
             if options.profile.color == .hlg { failHDR(error.appMessage) } else { stop(reason: error.appMessage, success: false) }
         case .success(.dropped(let sequence)):
             pending.removeValue(forKey: sequence); encoderRecovery.didDrop(at: monotonicNS()); forceKeyframe = true
+            cachedReplay.dropped(sequence)
+            // Bound retry cadence if the hardware encoder repeatedly drops the recovery frame.
+            queue.asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self] in self?.replayLatestIfNeeded() }
         case .success(.frame(let frame)):
             encoderRecovery.didEncode()
             encoded += 1; bytes += UInt64(frame.bytes.count)
@@ -522,6 +546,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         case "hdr-error": failHDR(AppMessage(raw: json["message"] as? String ?? "Pad HDR output failed"))
         case "ack":
             guard let seq = (json["seq"] as? NSNumber)?.uint64Value, let start = pending.removeValue(forKey: seq) else { stop(reason: "Pad 返回无效帧确认。", success: false); return }
+            cachedReplay.acknowledged(seq, decoded: json["decoded"] as? Bool == true)
             if json["decoded"] as? Bool == true {
                 rendered += 1; pathSamples.append(Double(monotonicNS() - start) / 1e6)
                 if pathSamples.count > 6000 { pathSamples.removeFirst(1000) }
@@ -530,8 +555,26 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
                     if decodeSamples.count > 6000 { decodeSamples.removeFirst(1000) }
                 }
             } else { skipped += 1; forceKeyframe = true }
-        case "keyframe": forceKeyframe = true
+            if cachedReplay.needed {
+                queue.asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self] in self?.replayLatestIfNeeded() }
+            }
+        case "keyframe":
+            forceKeyframe = true
+            // Static desktops may have no new SCStream frame after a Surface is recreated.
+            cachedReplay.request(); replayLatestIfNeeded()
         case "stats":
+            if let visible = json["viewerVisible"] as? Bool, visible != viewerVisible {
+                let now = monotonicNS()
+                if let since = visibleSinceNS { visibleDurationNS += now - since }
+                visibleSinceNS = visible && ready ? now : nil
+                viewerVisible = visible
+                // A deliberate background pause is not a hardware-encoder stall.
+                encoderRecovery.didEncode()
+                if visible {
+                    forceKeyframe = true
+                    cachedReplay.request(); replayLatestIfNeeded()
+                }
+            }
             remote = json
             DispatchQueue.main.async { self.onPeerStats?(json) }
             if let format = json["videoFormat"] as? [String: Any] {
@@ -553,7 +596,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         // A static desktop may never emit a replacement for a dropped frame.
         // End a stalled session even after a single drop, rather than report a
         // connected black/stale picture forever. A successful output resets it.
-        if encoderRecovery.stalled(at: now) {
+        if viewerVisible && encoderRecovery.stalled(at: now) {
             let reason: AppMessage = "硬件编码器丢帧后未恢复，请降低帧率或分辨率。"
             if options.profile.color == .hlg { failHDR(reason) } else { stop(reason: reason, success: false) }
             return
@@ -577,7 +620,8 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         DispatchQueue.main.async { [weak self] in self?.onMetrics?(metrics) }
         lastTickNS = now; lastTickEncoded = encoded; lastTickSource = sourceFrames
         log(String(format: "编码 %.1f fps · Pad 呈现回调 %.1f fps · 解码往返 P95 %.1f ms · 队列 %d/%d", row["encodeFps"] as? Double ?? 0, remote["renderFps"] as? Double ?? 0, percentile(pathSamples, 0.95), pending.count, maxInFlight))
-        if options.profile.color == .hlg && !verifiedHDR && elapsed > 8 { failHDR("8 秒内未收到 Pad HDR 输出确认"); return }
+        let visibleSeconds = Double(visibleDurationNS + (visibleSinceNS.map { now - $0 } ?? 0)) / 1e9
+        if options.profile.color == .hlg && !verifiedHDR && visibleSeconds > 8 { failHDR("8 秒内未收到 Pad HDR 输出确认"); return }
         if options.seconds > 0 && elapsed >= options.seconds {
             let highlightsOK = options.profile.color != .hlg || !options.capturePattern || highlightVerified
             stop(reason: highlightsOK ? "测试完成。" : "HDR 高光阶梯未通过，检查测试窗口是否被遮挡或源画面被截断。",
@@ -601,6 +645,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         touchInput.close()
         channel?.close()
         Task { @MainActor in
+            self.notchController?.close(); self.notchController = nil
             self.display?.suspendEnforcement()
             self.startupTask?.cancel()
             // ADB can create a forward before returning it. Wait for ownership
@@ -614,15 +659,18 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
                 // CGDisplayStreamStop returns before the final callback. Keep
                 // the stream alive until .stopped, as required by its contract.
                 self.queue.sync { self.active = false }
-                self.needsRestart = !(await self.hdrLifetime.stop(hdrStream))
-                if self.needsRestart { cleanupFailure = "HDR 采集停止未获确认，请退出并重新打开 Nextend。" }
+                if !(await self.hdrLifetime.stop(hdrStream)) {
+                    let lifetime = self.hdrLifetime
+                    self.cleanupRecovery.waitUntil { lifetime.isStopped }
+                    cleanupFailure = "正在等待 HDR 采集停止；确认后会自动恢复连接入口。"
+                }
                 self.hdrCaptureStarted = false
             }
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                 self.queue.async {
                     self.active = false; self.tick?.cancel(); self.tick = nil; self.controlTimer?.cancel(); self.controlTimer = nil
                     self.patternTimer?.cancel(); self.patternTimer = nil
-                    self.encoder?.close(); self.encoder = nil; self.pending.removeAll()
+                    self.encoder?.close(); self.encoder = nil; self.pending.removeAll(); self.latestBuffer = nil
                     self.hdrConverter = nil
                     continuation.resume()
                 }
@@ -635,7 +683,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
                 await Task.detached { ADB.removeForward(serial: forward.serial, port: forward.port) }.value
             }
             self.stateLock.lock(); let canFallback = !self.fallbackCancelled; self.stateLock.unlock()
-            if !self.needsRestart, canFallback, let fallback, let onFallback = self.onFallback {
+            if self.cleanupRecovery.check(), canFallback, let fallback, let onFallback = self.onFallback {
                 // Keep the owned display through an HDR → SDR transition.
                 // Reapplying SDR settings avoids WindowServer's asynchronous
                 // destroy/recreate race for the same monitor identity.
@@ -648,12 +696,13 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
             if let retiredDisplay = self.display {
                 self.display = nil
                 if !(await retiredDisplay.closeAndWait()) {
-                    self.needsRestart = true
-                    cleanupFailure = "macOS 未释放虚拟屏，已停止重连。请退出并重新打开 Nextend 后重试。"
+                    self.cleanupRecovery.waitUntil { retiredDisplay.isReleased }
+                    cleanupFailure = "正在等待 macOS 释放虚拟屏；确认后会自动恢复连接入口。"
                 }
             }
-            let finalReason = cleanupFailure ?? reason
-            let completed = success && self.ready && !self.needsRestart
+            let released = self.cleanupRecovery.check()
+            let finalReason = released ? reason : (cleanupFailure ?? reason)
+            let completed = success && self.ready && released
             self.queue.sync { self.writeReport(reason: finalReason, success: completed) }
             log(finalReason.text); self.onStatus?(finalReason, .information)
             self.onFinish?(completed)

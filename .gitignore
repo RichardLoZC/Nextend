@@ -18,3 +18,9 @@ android/**/build/
 .idea/
 __pycache__/
 *.pyc
+
+# Public verification key; private signing keys remain excluded.
+!ops/update-public-key.pem
+
+# Mountain Duck version history is not source code.
+.duckversions/

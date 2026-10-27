@@ -37,7 +37,9 @@ import ApplicationServices
     private var outputColor = VideoColor.sdr
     private var hdrVerified = false
     private var fallbackUsed = false
-    private var restartRequired = false
+    private var cleanupRecovery: ConnectionRecovery?
+    private var recoveryTimer: Timer?
+    private var listenerMessage: AppMessage?
     private var quitting = false
     private var signalSources: [DispatchSourceSignal] = []
     private let arguments = CommandLine.arguments
@@ -65,8 +67,10 @@ import ApplicationServices
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem?.button?.image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "Nextend")
         refreshLanguage()
-        requestServer = ConnectRequestServer { [weak self] peer, command in
-            guard let self, !self.restartRequired, !self.quitting else { return .rejected }
+        requestServer = ConnectRequestServer(onStatus: { [weak self] message in
+            self?.listenerMessage = message; self?.renderConnection()
+        }) { [weak self] peer, command in
+            guard let self, self.checkRecovery(), !self.quitting else { return .rejected }
             if command == "resume" {
                 guard peer != "127.0.0.1", self.session != nil, let pending = self.reverseConnection, pending.isWaiting else { return .rejected }
                 return ConnectRequestDecision(accepted: true, reverse: pending)
@@ -205,13 +209,18 @@ import ApplicationServices
     }
     private func renderConnection() {
         statusLabel.stringValue = lastMessage.text
+        if session == nil, let listenerMessage { statusLabel.stringValue += "\n" + listenerMessage.text }
         switch connectionState {
         case .idle: connectionHeading.stringValue = L("等待连接", "Ready to connect")
         case .connecting: connectionHeading.stringValue = L("正在连接", "Connecting")
         case .connected: connectionHeading.stringValue = L("已连接", "Connected") + " · " + (activeWireless ? L("加密无线", "Encrypted Wi-Fi") : "USB")
         case .finished(let success): connectionHeading.stringValue = success ? L("已断开", "Disconnected") : L("连接已结束", "Connection ended")
         }
-        if case .connected = connectionState { connectButton?.title = L("断开连接", "Disconnect") }
+        if cleanupRecovery != nil {
+            connectionHeading.stringValue = L("正在恢复连接", "Recovering connection")
+            connectButton?.title = L("重新检查", "Check again")
+        }
+        else if case .connected = connectionState { connectButton?.title = L("断开连接", "Disconnect") }
         else { connectButton?.title = session == nil ? L("连接", "Connect") : L("取消连接", "Cancel") }
         connectButton?.needsDisplay = true
         if session != nil {
@@ -230,7 +239,7 @@ import ApplicationServices
         menu.addItem(item(AppLanguage.english ? "切换到中文" : "Switch to English", #selector(languageChanged)))
         let tests = item(L("诊断", "Diagnostics"), nil); tests.submenu = NSMenu(); tests.submenu?.autoenablesItems = false
         for (name, selector) in [(L("桌面采集测试 · 30 秒", "Desktop capture test · 30 s"), #selector(desktopTest)), (L("合成测试 · 30 秒", "Synthetic test · 30 s"), #selector(testPattern))] {
-            let test = item(name, selector); test.isEnabled = session == nil && !restartRequired; tests.submenu?.addItem(test)
+            let test = item(name, selector); test.isEnabled = session == nil && cleanupRecovery == nil; tests.submenu?.addItem(test)
         }
         menu.addItem(tests)
         menu.addItem(item(L("Pad 设置", "Pad settings"), #selector(showPadSettings)))
@@ -271,7 +280,33 @@ import ApplicationServices
         UserDefaults.standard.set(options.host, forKey: "padIP"); UserDefaults.standard.set(options.interface, forKey: "interface")
         return options
     }
-    @objc private func connect() { if let session { connectButton.isEnabled = false; session.cancel() } else { start(uiOptions(synthetic: false), cli: false) } }
+    @objc private func connect() {
+        if let session {
+            connectButton.isEnabled = false
+            lastMessage = "正在取消连接并清理资源…"; renderConnection(); session.cancel()
+        } else if checkRecovery() { start(uiOptions(synthetic: false), cli: false) }
+        else { lastMessage = "旧会话仍在清理，正在自动检查。释放后即可重新连接。"; renderConnection() }
+    }
+    @discardableResult private func checkRecovery() -> Bool {
+        guard let pending = cleanupRecovery else { return true }
+        guard pending.check() else { return false }
+        cleanupRecovery = nil; recoveryTimer?.invalidate(); recoveryTimer = nil
+        lastMessage = "清理已完成，可以重新连接。"; connectButton?.isEnabled = true
+        renderConnection(); rebuildMenus()
+        return true
+    }
+    private func watchRecovery(_ pending: ConnectionRecovery) {
+        recoveryTimer?.invalidate(); recoveryTimer = nil
+        let wasPending = pending.isPending
+        cleanupRecovery = pending.check() ? nil : pending
+        if wasPending && cleanupRecovery == nil { lastMessage = "清理已完成，可以重新连接。" }
+        guard cleanupRecovery != nil else { return }
+        // Common modes keep recovery progressing while menus are open.
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.checkRecovery() }
+        }
+        recoveryTimer = timer; RunLoop.main.add(timer, forMode: .common)
+    }
     @objc private func testPattern() { start(uiOptions(synthetic: true), cli: false) }
     @objc private func desktopTest() { var options = uiOptions(synthetic: false); options.capturePattern = true; options.seconds = 30; start(options, cli: false) }
     @objc private func disconnect() { session?.cancel() }
@@ -290,6 +325,8 @@ import ApplicationServices
         updatePeerStats(); padPanel?.showWindow(nil); padPanel?.window?.center()
     }
     private func updatePeerStats() {
+        padPanel?.updatePreview(panelWidth: peerStats["panelWidth"] as? Int ?? 3200, panelHeight: peerStats["panelHeight"] as? Int ?? 2136,
+            videoWidth: peerStats["videoWidth"] as? Int ?? 3200, videoHeight: peerStats["videoHeight"] as? Int ?? 2136)
         func n(_ key: String) -> String { (peerStats[key] as? Double).map { String(format: "%.1f", $0) } ?? "—" }
         padPanel?.diagnostics.stringValue = L("呈现", "Rendered") + " \(n("renderFps")) fps · " + L("面板", "Display") + " \(n("displayHz")) Hz\n" + L("解码", "Decoded") + " \(n("decodeFps")) fps · " + L("丢弃", "Dropped") + " \(n("dropped")) · " + L("温控", "Thermal") + " \(n("thermal"))"
     }
@@ -312,7 +349,7 @@ import ApplicationServices
     }
     @objc private func arrangement() { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Displays-Settings.extension")!) }
     private func start(_ options: SessionOptions, cli: Bool, retainedDisplay: VirtualDisplay? = nil) {
-        guard session == nil, !restartRequired else { return }
+        guard session == nil, checkRecovery(), !quitting else { return }
         reverseConnection = options.wireless && !cli ? ReverseConnectionWaiter() : nil
         let session = Session(options: options, retainedDisplay: retainedDisplay, reverseConnection: reverseConnection); self.session = session
         activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical], reason: "Nextend desktop streaming")
@@ -353,9 +390,9 @@ import ApplicationServices
             self.renderConnection()
         }
         session.onFinish = { [weak self, weak session] success in
-            guard let self, let session else { return }
-            self.session = nil; self.endActivity(); self.restartRequired = session.needsRestart
-            self.connectButton?.isEnabled = !self.restartRequired; self.settingControls.forEach { $0.isEnabled = true }
+            guard let self, let session, self.session === session else { return }
+            self.session = nil; self.endActivity(); self.watchRecovery(session.cleanupRecovery)
+            self.connectButton?.isEnabled = true; self.settingControls.forEach { $0.isEnabled = true }
             self.connectionState = .finished(success); self.deviceArt.connected = false; self.metricLabels.forEach { $0.stringValue = "—" }
             self.renderConnection(); self.rebuildMenus()
             if cli { exit(success ? 0 : 1) } else if self.quitting { NSApp.terminate(nil) }
@@ -394,7 +431,7 @@ import ApplicationServices
         // Cancel this attempt and terminate after asynchronous display cleanup.
         quitting = true; session.cancel(); return .terminateCancel
     }
-    func applicationWillTerminate(_ notification: Notification) { requestServer?.close() }
+    func applicationWillTerminate(_ notification: Notification) { recoveryTimer?.invalidate(); requestServer?.close() }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag { showWindow() }; return true

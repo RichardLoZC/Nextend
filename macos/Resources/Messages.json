@@ -132,5 +132,13 @@
   "配对已撤销，请通过 USB 重新连接。": "Pairing revoked. Reconnect using USB.",
   "连接请求无效。": "Invalid connection request.",
   "连接请求认证失败。": "Connection request authentication failed.",
-  "连接地址无效。": "Invalid connection address."
+  "连接地址无效。": "Invalid connection address.",
+  "正在等待 HDR 采集停止；确认后会自动恢复连接入口。": "Waiting for HDR capture to stop. Connecting will become available automatically.",
+  "正在等待 macOS 释放虚拟屏；确认后会自动恢复连接入口。": "Waiting for macOS to release the virtual display. Connecting will become available automatically.",
+  "正在取消连接并清理资源…": "Cancelling the connection and releasing resources…",
+  "旧会话仍在清理，正在自动检查。释放后即可重新连接。": "The previous session is still being cleaned up. Checking automatically; reconnect when it is released.",
+  "清理已完成，可以重新连接。": "Cleanup complete. You can connect again.",
+  "Pad 连接请求服务暂不可用，正在自动重试（错误 {0}）。": "The Pad connection request service is unavailable. Retrying automatically (error {0}).",
+  "ADB 输出过大，已停止命令。": "ADB output exceeded its limit. The command was stopped.",
+  "ADB 命令超时，请检查 USB 连接后重试。": "ADB timed out. Check the USB connection and try again."
 }

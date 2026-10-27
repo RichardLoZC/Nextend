@@ -120,16 +120,19 @@ private func readDisplayLines(_ handle: FileHandle, line: @escaping (Data) -> Vo
         // SIGTERM is reset to its default in the helper. The parent waits for
         // process death AND WindowServer removal before allowing a reconnect.
         for _ in 0..<20 {
-            if !process.isRunning && removedFromOnlineList() { return true }
+            if isReleased { return true }
             await cleanupDelay()
         }
         if process.isRunning { kill(process.processIdentifier, SIGKILL) }
         for _ in 0..<12 {
-            if !process.isRunning && removedFromOnlineList() { return true }
+            if isReleased { return true }
             await cleanupDelay()
         }
-        return false
+        return isReleased
     }
+    // Keep this object after a timeout so a late WindowServer removal can be
+    // observed without creating a second display or restarting the app.
+    var isReleased: Bool { closed && !process.isRunning && removedFromOnlineList() }
     private func cleanupDelay() async {
         // This can run inside a cancelled startup task. Cleanup must still
         // wait for real time to pass instead of swallowing CancellationError.

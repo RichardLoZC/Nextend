@@ -1,8 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-"$ROOT/scripts/build-macos.sh"
-"$ROOT/outputs/Nextend.app/Contents/MacOS/Nextend" --self-test
-"$ROOT/scripts/build-android.sh" "$@"
+bash "$ROOT/scripts/build-macos.sh"
+python3 "$ROOT/scripts/test-macos.py"
+bash "$ROOT/scripts/build-android.sh" "$@"
+python3 "$ROOT/tests/discovery_recovery.py"
+python3 -m unittest discover -s "$ROOT/tests" -p "test_*release*.py"
 # Device integration is deliberately separate so ordinary tests do not interrupt a live display:
 # python3 tests/device_protocol.py

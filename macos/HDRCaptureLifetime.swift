@@ -9,6 +9,7 @@ final class HDRCaptureLifetime: @unchecked Sendable {
     private var retainedStream: CGDisplayStream?
     private var stopped = false
     private var waiter: CheckedContinuation<Bool, Never>?
+    var isStopped: Bool { lock.lock(); defer { lock.unlock() }; return stopped }
     func retainUntilStopped(_ stream: CGDisplayStream) {
         lock.lock(); retainedStream = stream; lock.unlock()
     }

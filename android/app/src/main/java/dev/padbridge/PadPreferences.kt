@@ -11,6 +11,14 @@ object PadPreferences {
             val v = json.get(name); require(v is Number && v.toDouble() == v.toInt().toDouble() && v.toInt() in range)
         }
         for (name in listOf("x", "y")) { val v = json.get(name); require(v is Number && v.toDouble().isFinite() && v.toDouble() in 0.0..1.0) }
+        if (json.has("safeArea")) {
+            val area = json.getJSONObject("safeArea")
+            require(area.get("enabled") is Boolean)
+            for (name in listOf("top", "right", "bottom", "left")) {
+                val value = area.get(name)
+                require(value is Number && value.toDouble().isFinite() && value.toDouble() in 0.0..0.2)
+            }
+        }
         return json
     }
 }

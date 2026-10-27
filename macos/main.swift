@@ -8,6 +8,14 @@ if CommandLine.arguments.contains("--display-host") {
 if CommandLine.arguments.contains("--self-test") {
     do { try runSelfTests(); exit(0) } catch { print("FAIL: \(error)"); exit(1) }
 }
+if CommandLine.arguments.contains("--recovery-self-test") {
+    Task { @MainActor in
+        do { try await recoverySelfTest(); exit(0) }
+        catch { print("FAIL: \(error)"); exit(1) }
+    }
+    RunLoop.main.run()
+    exit(1)
+}
 if CommandLine.arguments.contains("--help") {
     print("""
     Nextend: --probe-display | --self-test | --benchmark | --capture-test | --connect
@@ -62,6 +70,21 @@ func runSelfTests() throws {
         try check(lower.frameCredits <= 6 && lower.frameCredits == (fps == 60 ? 4 : 6), "high-refresh credits respect receiver capacity")
     }
     var recovery = EncoderRecovery()
+    var replay = CachedFrameReplay()
+    replay.request()
+    try check(!replay.canSubmit(visible: true, credits: 0, hasFrame: true) && replay.needed, "full queue preserves static-desktop replay")
+    try check(!replay.canSubmit(visible: false, credits: 1, hasFrame: true), "background replay waits for a visible surface")
+    try check(replay.canSubmit(visible: true, credits: 1, hasFrame: true), "ACK credit releases queued replay without a new capture")
+    replay.submitted(5)
+    try check(!replay.needed, "one recovery frame consumes the request")
+    replay.dropped(4)
+    try check(!replay.needed, "unrelated old frame drop does not duplicate recovery")
+    replay.dropped(5)
+    try check(replay.needed, "dropped cached frame is retried")
+    replay.submitted(6); replay.acknowledged(6, decoded: false)
+    try check(replay.needed, "receiver rejecting the recovery keyframe schedules another replay")
+    replay.submitted(7); replay.acknowledged(7, decoded: true); replay.dropped(5)
+    try check(!replay.needed, "decoded recovery completes the request")
     try check(!recovery.stalled(at: 9_000_000_000), "static desktop without drops stays connected")
     recovery.didDrop(at: 10_000_000_000)
     try check(!recovery.stalled(at: 12_000_000_000), "transient frame drop has a recovery window")
@@ -71,6 +94,34 @@ func runSelfTests() throws {
     try check(!recovery.stalled(at: 20_000_000_000) && recovery.dropped == 2, "successful output clears the stall but keeps diagnostics")
     recovery.didDrop(at: 20_000_000_000)
     try check(recovery.stalled(at: 23_000_000_001), "single dropped static frame cannot hang forever")
+    try check(PadDisplayArea.normalized(.nan, fallback: 0.03) == 0.03, "non-finite safe margin uses default")
+    try check(PadDisplayArea.normalized(-1) == 0 && PadDisplayArea.normalized(1) == 0.2, "safe margins remain bounded")
+    let area = PadDisplayArea()
+    try check(area.json["enabled"] as? Bool == false && area.json["top"] as? Double == 0.03, "safe-area reset preserves full desktop by default")
+    let invalidNotch = PadNotch(enabled: true, left: .nan, right: .infinity, depth: -1).normalized
+    try check(invalidNotch.left == 0.44 && invalidNotch.right == 0.56 && invalidNotch.depth == 0.01, "cutout bounds reject non-finite and negative coordinates")
+    let reversedNotch = PadNotch(left: 0.8, right: 0.2).normalized
+    try check(reversedNotch.right >= reversedNotch.left + 0.02, "cutout guides cannot cross")
+    let padBounds = CGRect(x: -1600, y: -200, width: 1600, height: 1068)
+    let notch = PadNotch(enabled: true, left: 0.44, right: 0.56)
+    let fold = notch.foldFrame(in: padBounds, barHeight: 30)
+    let icons = [CGRect(x: fold.minX - 50, y: -200, width: 34, height: 30),
+                 CGRect(x: fold.maxX + 8, y: -200, width: 34, height: 30),
+                 CGRect(x: 10, y: -200, width: 34, height: 30),
+                 CGRect(x: fold.minX, y: -100, width: 34, height: 30)]
+    try check(notch.hidden(icons, in: padBounds, barHeight: 30) == [0], "fold only icons before the boundary on the target menu bar")
+    let axOne = AXUIElementCreateApplication(10001), axTwo = AXUIElementCreateApplication(10002)
+    let firstItem = PadMenuBarItem(element: axOne, frame: icons[0], title: "Two icons", pid: 77)
+    let secondItem = PadMenuBarItem(element: axTwo, frame: icons[1], title: "Two icons", pid: 77)
+    try check(PadMenuBarInventory.uniqueMatch(secondItem, in: [firstItem, secondItem])?.hasSameElement(as: secondItem) == true, "match exact AX item when app and title repeat")
+    try check(PadMenuBarInventory.uniqueMatch(secondItem, in: [secondItem, secondItem]) == nil, "reject ambiguous duplicate menu targets")
+    let movedItem = PadMenuBarItem(element: axTwo, frame: icons[0], title: "Two icons", pid: 77)
+    try check(PadMenuBarInventory.uniqueMatch(secondItem, in: [movedItem])?.frame == icons[0], "resolve latest menu item position")
+    try check(!PadMenuBarInventory.sameLayout([secondItem], [movedItem]) && !PadMenuBarInventory.sameLayout([secondItem], [firstItem]), "invalidate thumbnails on movement or identity replacement")
+    var padSettings = PadSettings(); padSettings.displayArea.enabled = true; padSettings.notch = notch
+    try check((padSettings.json["safeArea"] as? [String: Any])?["enabled"] as? Bool == false, "cutout folding preserves full-size desktop despite saved margins")
+    padSettings.notch.enabled = false; padSettings.notch.guides = true
+    try check((padSettings.json["safeArea"] as? [String: Any])?["enabled"] as? Bool == false, "calibration uses the same full-size coordinate space")
     try HDRConverter.selfTest()
     try touchSelfTest()
     try reverseConnectionSelfTest()

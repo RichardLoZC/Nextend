@@ -6,6 +6,10 @@ import java.net.Socket
 import java.nio.ByteBuffer
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.CountDownLatch
 import javax.crypto.Cipher
 import javax.crypto.Mac
 import javax.crypto.spec.GCMParameterSpec
@@ -37,7 +41,8 @@ object PairCrypto {
     }
 }
 
-class SecureChannel(private val socket: Socket, key: ByteArray, private val requestClient: Boolean = false) : AutoCloseable {
+class SecureChannel(private val socket: Socket, key: ByteArray, private val requestClient: Boolean = false,
+                    private val writeTimeoutMillis: Long = 5000) : AutoCloseable {
     private val input = DataInputStream(socket.getInputStream())
     private val output = DataOutputStream(socket.getOutputStream())
     private val sendKey: ByteArray
@@ -45,6 +50,9 @@ class SecureChannel(private val socket: Socket, key: ByteArray, private val requ
     private var sendSequence = 0L
     private var receiveSequence = 0L
     private var handshakeDeadlineNS: Long? = System.nanoTime() + 5_000_000_000L
+    private val closed = AtomicBoolean(false)
+    private val ending = AtomicBoolean(false)
+    private val closedSignal = CountDownLatch(1)
     init {
         require(key.size == 32)
         socket.tcpNoDelay = true
@@ -92,7 +100,13 @@ class SecureChannel(private val socket: Socket, key: ByteArray, private val requ
     }
     private fun writeRaw(body: ByteArray) {
         require(body.size in 1..MAX_PACKET)
-        output.writeInt(body.size); output.write(body); output.flush()
+        check(!closed.get()) { "Connection closed" }
+        val pending = AtomicBoolean(true)
+        // SO_TIMEOUT only bounds reads. Closing from another thread also wakes
+        // a blocked writer and every sender waiting on the send monitor.
+        val deadline = watchdog.schedule({ if (pending.compareAndSet(true, false)) close() }, writeTimeoutMillis, TimeUnit.MILLISECONDS)
+        try { output.writeInt(body.size); output.write(body); output.flush() }
+        finally { pending.set(false); deadline.cancel(false) }
     }
     @Synchronized fun send(body: ByteArray) {
         check(sendSequence < Long.MAX_VALUE)
@@ -103,6 +117,26 @@ class SecureChannel(private val socket: Socket, key: ByteArray, private val requ
         val body = PairCrypto.open(readRaw(if (requestClient) 4096 else MAX_PACKET), receiveKey, receiveSequence); receiveSequence++
         return body
     }
-    override fun close() { runCatching { socket.close() } }
-    companion object { const val MAX_PACKET = 16 * 1024 * 1024 }
+    /** Decoder errors may preserve HDR fallback, but never block the UI/codec
+     * thread or delay socket closure indefinitely while reporting the error. */
+    fun closeWithError(body: ByteArray): CountDownLatch {
+        if (closed.get() || !ending.compareAndSet(false, true)) return closedSignal
+        val deadline = watchdog.schedule({ close() }, 250, TimeUnit.MILLISECONDS)
+        Thread({
+            try { send(body) } catch (_: Exception) { /* Best effort before closing. */ }
+            finally { close(); deadline.cancel(false) }
+        }, "Nextend-error-close").apply { isDaemon = true; start() }
+        return closedSignal
+    }
+    override fun close() {
+        if (closed.compareAndSet(false, true)) {
+            try { runCatching { socket.close() } } finally { closedSignal.countDown() }
+        }
+    }
+    companion object {
+        const val MAX_PACKET = 16 * 1024 * 1024
+        private val watchdog = ScheduledThreadPoolExecutor(1) { action ->
+            Thread(action, "Nextend-write-deadline").apply { isDaemon = true }
+        }.apply { removeOnCancelPolicy = true }
+    }
 }

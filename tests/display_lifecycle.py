@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real macOS helper lifecycle checks. Run alone; temporarily adds one display."""
 import ctypes
+import os
 import json
 from pathlib import Path
 import select
@@ -9,7 +10,7 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
-APP = str(ROOT / "outputs/Nextend.app/Contents/MacOS/Nextend")
+APP = os.environ.get("NEXTEND_TEST_APP", str(ROOT / "outputs/Nextend.app/Contents/MacOS/Nextend"))
 ARGS = [APP, "--display-host", "2400", "1600", "60", "bt2020-limited-hlg10"]
 CG = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
 

@@ -15,7 +15,7 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 class Receiver(
-    private val address: String, private val key: () -> ByteArray, private val surface: Surface,
+    private val address: String, private val key: () -> ByteArray,
     private val panelWidth: Int, private val panelHeight: Int,
     private val hdrTypes: IntArray,
     private val lease: SessionLease,
@@ -23,7 +23,7 @@ class Receiver(
     private val listening: (Boolean) -> Unit,
     private val status: (UiText, Boolean) -> Unit,
     private val stats: (RenderStats) -> Unit,
-    private val mode: (Int) -> Unit, private val refresh: () -> Float,
+    private val mode: (Int, Int, Int) -> Unit, private val refresh: () -> Float,
     private val touchMode: (TouchSender, TouchMode) -> Unit,
     private val settings: (JSONObject) -> Unit, private val resetPairing: () -> Unit, private val pairingChanged: () -> Unit,
     private val thermal: () -> Int
@@ -32,6 +32,17 @@ class Receiver(
     @Volatile private var server: ServerSocket? = null
     @Volatile private var socket: Socket? = null
     private val lifecycleLock = Any()
+    private val outputLock = Any()
+    private var outputSurface: Surface? = null
+    private var activeDecoder: VideoDecoder? = null
+    fun hasClient(): Boolean = synchronized(lifecycleLock) { socket != null }
+    fun setSurface(surface: Surface?, waitForRelease: Boolean = false) {
+        val decoder = synchronized(outputLock) {
+            outputSurface = surface
+            activeDecoder?.also { it.setSurface(surface) }
+        }
+        if (waitForRelease) decoder?.awaitSurfaceRelease()
+    }
     private val worker = Thread({ listen() }, "PadBridge-receiver")
     private var reverseWorker: Thread? = null
     fun start() { worker.start() }
@@ -65,6 +76,7 @@ class Receiver(
         var ownsSession = false
         var releaseDelegated = false
         var ended = UiText("连接已结束", "Disconnected")
+        val failure = AtomicReference<UiText?>(null)
         try {
             client.use {
                 // Never let an unauthenticated socket acquire the shared Surface.
@@ -81,11 +93,11 @@ class Receiver(
                 if (running) {
                     require(java.security.MessageDigest.isEqual(pairedKey, key())) { "Pairing changed" }
                     releaseDelegated = true
-                    serve(secure) { lease.release(client) }
+                    serve(secure, failure) { lease.release(client) }
                 }
             }
         } catch (e: Exception) {
-            ended = UiText("连接结束：${e.message}", "Connection ended: ${e.message}")
+            ended = failure.get() ?: UiText("连接结束：${e.message}。请重试连接。", "Connection ended: ${e.message}. Try connecting again.")
         } finally {
             // serve() closes its decoder before another transport can enter.
             if (ownsSession) {
@@ -95,7 +107,7 @@ class Receiver(
             synchronized(lifecycleLock) { if (socket === client) socket = null }
         }
     }
-    private fun serve(channel: SecureChannel, releaseSession: () -> Unit) {
+    private fun serve(channel: SecureChannel, failure: AtomicReference<UiText?>, releaseSession: () -> Unit) {
         var decoder: VideoDecoder? = null
         var touch: TouchSender? = null
         val scheduler = Executors.newSingleThreadScheduledExecutor()
@@ -137,10 +149,9 @@ class Receiver(
             require(!config.optBoolean("input", false))
             val controlsNegotiated = config.optInt("controlsVersion", 0) == 1
             val touchNegotiated = config.optInt("touchVersion", 0) == 1
-            mode(fps)
-            surface.setFrameRate(fps.toFloat(), Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+            mode(width, height, fps)
             if (!running) return
-            decoder = VideoDecoder(surface, if (encoding == "hevc") "video/hevc" else "video/avc", width, height, fps, color,
+            decoder = VideoDecoder(if (encoding == "hevc") "video/hevc" else "video/avc", width, height, fps, color,
                 ack = { sequence, accepted, delay ->
                     if (accepted) decoded.incrementAndGet() else dropped.incrementAndGet()
                     runCatching { send(JSONObject().put("type", "ack").put("seq", sequence).put("decoded", accepted).put("receiveToDecodeMs", delay)) }
@@ -149,13 +160,18 @@ class Receiver(
                 requestKeyframe = { runCatching { send(JSONObject().put("type", "keyframe")) }.onFailure { channel.close() } },
                 outputFormat = { values -> actualFormat.set(values) },
                 fail = { message ->
-                    runCatching { send(JSONObject().put("type", if (color == VideoColor.HLG) "hdr-error" else "error").put("message", message)) }
-                    status(UiText("解码停止：$message", "Decoder stopped: $message"), false); channel.close()
+                    failure.compareAndSet(null, UiText("解码停止：$message。请重试或在 Mac 降低画质。", "Decoder stopped: $message. Retry or lower quality on the Mac."))
+                    channel.closeWithError(byteArrayOf(1) + JSONObject().put("type", if (color == VideoColor.HLG) "hdr-error" else "error").put("message", message).toString().toByteArray())
                 })
             send(JSONObject().put("type", "ready").put("decoder", decoder.name).put("width", width).put("height", height)
                 .put("color", color.wire).put("bitDepth", color.bitDepth).also { if (touchNegotiated) it.put("touchVersion", 1); if (controlsNegotiated) it.put("controlsVersion", 1) })
             val summary = UiText("$width × $height · $fps fps 目标 · ${encoding.uppercase()} · ${color.title}", "$width × $height · Target $fps fps · ${encoding.uppercase()} · ${color.title}")
             status(summary, true)
+            // Publish ready before the decoder can send keyframe/error messages.
+            synchronized(outputLock) {
+                activeDecoder = decoder
+                if (running) decoder.setSurface(outputSurface)
+            }
             if (touchNegotiated) touch = TouchSender(width, height, ::send) { channel.close() }
             scheduler.scheduleAtFixedRate({
                 val now = System.nanoTime(); val count = rendered.get(); val decodedCount = decoded.get()
@@ -165,7 +181,7 @@ class Receiver(
                 runCatching {
                     send(JSONObject().put("type", "stats").put("renderFps", rate).put("rendered", count)
                         .put("decodeFps", decodeRate).put("decoded", decodedCount).put("renderCallbackLastDelayMs", java.lang.Double.longBitsToDouble(renderDelayBits.get()))
-                        .put("received", totalReceived.get()).put("dropped", dropped.get()).put("displayHz", refresh()).put("thermal", thermal())
+                        .put("viewerVisible", decoder.visible).put("panelWidth", panelWidth).put("panelHeight", panelHeight).put("videoWidth", width).put("videoHeight", height).put("received", totalReceived.get()).put("dropped", dropped.get()).put("displayHz", refresh()).put("thermal", thermal())
                     // Color evidence is reported only after MediaCodec's output-format callback.
                         // Nested stats extend v1 compatibly; old Mac rejects new message types.
                         .put("videoFormat", JSONObject().put("color", color.wire).put("format", JSONObject(actualFormat.get()))
@@ -207,11 +223,17 @@ class Receiver(
                 }
             }
         } catch (e: Exception) {
-            runCatching { send(JSONObject().put("type", if (color == VideoColor.HLG) "hdr-error" else "error").put("message", e.message ?: "Receive failed")) }
+            // A live peer may still need an HDR rejection to select SDR. This
+            // worker waits at most 300 ms; socket failures go straight to close.
+            if (e !is java.io.IOException) {
+                channel.closeWithError(byteArrayOf(1) + JSONObject().put("type", if (color == VideoColor.HLG) "hdr-error" else "error")
+                    .put("message", e.message ?: "Receive failed").toString().toByteArray()).await(300, TimeUnit.MILLISECONDS)
+            }
             throw e
         } finally {
-            touch?.close(); channel.close(); scheduler.shutdownNow()
-            runCatching { surface.setFrameRate(0f, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT) }
+            // Do not send over a failed transport before releasing it.
+            channel.close(); touch?.close(); scheduler.shutdownNow()
+            synchronized(outputLock) { activeDecoder = null }
             // If vendor teardown exceeds our UI wait, retain the lease until
             // the codec handler actually releases the old decoder.
             decoder?.closeWhenReleased(releaseSession) ?: releaseSession()
@@ -219,9 +241,7 @@ class Receiver(
     }
     override fun close() {
         synchronized(lifecycleLock) { running = false; runCatching { socket?.close() }; runCatching { server?.close() } }
-        if (Thread.currentThread() !== worker) worker.join(2500)
-        val reverse = synchronized(lifecycleLock) { reverseWorker }
-        if (Thread.currentThread() !== reverse) reverse?.join(2500)
+        // Native codec cleanup continues on its worker; the shared lease stays held until release.
     }
     companion object { const val PORT = 49371 }
 }

@@ -46,7 +46,7 @@ Pad 的输出格式证据放在既有 `stats.videoFormat` 字段，含 `color`�
 
 Mac 在编码前限制未确认帧数：默认 4；90/120 fps 且不超过 2400×1600 像素时为 6，始终不超过 Pad 解码器的 6 帧记账上限。丢弃发生在编码前，避免丢掉已编码的参考帧。VideoToolbox 的临时 frameDropped 归还对应额度并请求下一关键帧；3 秒内没有成功输出则明确结束，避免静态桌面丢首帧后永久黑屏。Pad 解码输出交给 Surface 后发送 `ack(seq,decoded,receiveToDecodeMs)` 归还额度；解码输入不足时丢弃到下一关键帧，并发送 `keyframe` 请求。`OnFrameRenderedListener` 单独产生统计，绝不控制发送额度。
 
-收到 `ready` 后立即启动每秒 `ping`/`pong` 保活，覆盖虚拟屏和采集器的准备阶段。准备超过 30 秒会发起取消；系统采集 API 返回后完成清理。3 秒未完成的解码确认、6 秒无任何响应会终止会话并释放虚拟屏。测试时长从采集器成功启动后计时；未知消息与未协商的输入消息被拒绝。HDR 还要求在 8 秒内收到已验证且有呈现帧的输出格式，否则回退。
+收到 `ready` 后立即启动每秒 `ping`/`pong` 保活，覆盖虚拟屏和采集器的准备阶段。准备超过 30 秒会发起取消；系统采集 API 返回后完成清理。3 秒未完成的解码确认、6 秒无任何响应会终止会话并释放虚拟屏。测试时长从采集器成功启动后计时；未知消息与未协商的输入消息被拒绝。HDR 还要求在 8 秒可见时间内收到已验证且有呈现帧的输出格式，否则回退。
 
 ## 统计口径
 
@@ -94,6 +94,12 @@ Mac GUI 监听 TCP 49372，并发布 `_nextend._tcp` Bonjour 服务；USB 存在
 
 回复为 `connect-result(accepted,reverse)`。reverse 为 true 时，Mac 在发送回复前预留等待槽，防止超时回退与移交交叉。成功后移交同一 TCP 的唯一所有权，关闭旧请求对象不会关闭视频 FD；失败或取消会释放等待者并关闭连接。视频仍使用新的 PDB1 nonce、认证证明和方向密钥，请求密钥不用于视频。
 
-Pad 每两秒探测已发现的 Mac；手动请求在同一锁内抢占轮询。接收器 socket 和共享 Surface lease 都空闲时才请求移交。接管同步完成，失败由请求方关闭 socket。Activity 暂停、Surface 重建和连接状态变更取消旧代次；解码器未释放前不消费下一次回退的连接槽。
+Pad 每两秒探测已发现的 Mac；手动请求在同一锁内抢占轮询。接收器 socket 和共享 Surface lease 都空闲时才请求移交。接管同步完成，失败由请求方关闭 socket。0.7.0 中请求与监听由 DisplayService 持有，Activity 暂停和 Surface 重建保留已有会话；服务重启和连接状态变更取消旧代次；解码器未释放前不消费下一次回退的连接槽。
 
 Pad 不能提供回连地址、指定画质或启用触屏。旧版直连回退只使用本地保存或已认证 TCP 来源地址。请求被接受后 20 秒仍无视频时，Pad 显示超时提示。
+
+## 0.7.0 可选后台与安全区字段
+
+`stats.viewerVisible` 表示 Pad 有有效输出 Surface。缺失时 Mac 按 true 兼容旧端；为 false 时新 Mac 暂停编码并继续控制保活。Pad 在无 Surface 时仍接收并负 ACK 视频，旧 Mac 因而可以继续传输。Surface 恢复使用已有 keyframe 请求，未增加消息类型；Mac 缓存最近采集帧，以支持静态桌面恢复。`stats` 还可附带 panelWidth/panelHeight/videoWidth/videoHeight，供设置预览使用。
+
+`pad-settings.safeArea` 为可选对象，包含 enabled 布尔值及 top/right/bottom/left 四个有限数值，每边范围 0…0.2，以完整 Pad 视口比例表示。非法值拒绝；旧 Mac 省略时保留已保存校准，旧 Pad 忽略额外字段。设置仍经过 controlsVersion:1 协商与既有认证。四边避让不修改传输分辨率、画面比例或触控协议，实际 SurfaceView 的完整视频区域映射到整张 Mac 虚拟屏。

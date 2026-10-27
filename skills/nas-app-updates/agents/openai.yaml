@@ -1,0 +1,4 @@
+interface:
+  display_name: "NAS 应用托管与自更新"
+  short_description: "统一自制应用的 NAS 发布、签名校验、自更新与旧版本兼容流程"
+  default_prompt: "使用 $nas-app-updates 对照现有项目，为这个应用接入 NAS 托管和安全自更新，并记录验证结果。"

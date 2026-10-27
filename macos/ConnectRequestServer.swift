@@ -11,23 +11,55 @@ final class ConnectRequestServer: @unchecked Sendable {
     private var service: NetService?
     private var usbTimer: DispatchSourceTimer?
     private var reverseSerial: String?
+    @MainActor private var enabled = false
+    @MainActor private var retryTask: Task<Void, Never>?
+    @MainActor private var retryAttempt = 0
+    private let port: UInt16
+    private let advertise: Bool
+    private let onStatus: @MainActor (AppMessage?) -> Void
+    private var hasListener: Bool { lock.lock(); defer { lock.unlock() }; return listening >= 0 }
+    var isListening: Bool { lock.lock(); defer { lock.unlock() }; return running }
     private let handler: @MainActor (String, String) -> ConnectRequestDecision
-    init(handler: @escaping @MainActor (String, String) -> ConnectRequestDecision) { self.handler = handler }
+    init(port: UInt16 = 49372, advertise: Bool = true,
+         onStatus: @escaping @MainActor (AppMessage?) -> Void = { _ in },
+         handler: @escaping @MainActor (String, String) -> ConnectRequestDecision) {
+        self.port = port; self.advertise = advertise; self.onStatus = onStatus; self.handler = handler
+    }
     @MainActor func start() {
+        guard !enabled else { return }
+        enabled = true; openListener()
+    }
+    @MainActor private func retry(_ error: Int32) {
+        guard enabled else { return }
+        service?.stop(); service = nil; usbTimer?.cancel(); usbTimer = nil
+        retryTask?.cancel()
+        let delay = min(30, 1 << min(retryAttempt, 5)); retryAttempt += 1
+        onStatus("Pad 连接请求服务暂不可用，正在自动重试（错误 \(error)）。")
+        retryTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+            guard let self, self.enabled else { return }
+            self.openListener()
+        }
+    }
+    @MainActor private func openListener() {
+        guard enabled, !hasListener else { return }
         let fd = socket(AF_INET, SOCK_STREAM, 0)
-        guard fd >= 0 else { return }
+        guard fd >= 0 else { retry(errno); return }
         var one: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout.size(ofValue: one)))
-        var address = sockaddr_in(); address.sin_family = sa_family_t(AF_INET); address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size); address.sin_port = UInt16(49372).bigEndian
+        var address = sockaddr_in(); address.sin_family = sa_family_t(AF_INET); address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size); address.sin_port = port.bigEndian
         let result = withUnsafePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
-        guard result == 0, listen(fd, 4) == 0 else { Darwin.close(fd); return }
+        guard result == 0, listen(fd, 4) == 0 else { let error = errno; Darwin.close(fd); retry(error); return }
         lock.lock(); listening = fd; running = true; lock.unlock()
-        let advertisement = NetService(domain: "local.", type: "_nextend._tcp.", name: Host.current().localizedName ?? "Nextend Mac", port: 49372)
-        advertisement.publish(); service = advertisement
+        retryAttempt = 0; retryTask = nil; onStatus(nil)
+        if advertise {
+            let advertisement = NetService(domain: "local.", type: "_nextend._tcp.", name: Host.current().localizedName ?? "Nextend Mac", port: Int32(port))
+            advertisement.publish(); service = advertisement
+            let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "Nextend.usb-request"))
+            timer.schedule(deadline: .now(), repeating: 5)
+            timer.setEventHandler { [weak self] in self?.prepareUSB() }; timer.resume(); usbTimer = timer
+        }
         DispatchQueue.global(qos: .utility).async { self.acceptLoop(fd) }
-        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "Nextend.usb-request"))
-        timer.schedule(deadline: .now(), repeating: 5)
-        timer.setEventHandler { [weak self] in self?.prepareUSB() }; timer.resume(); usbTimer = timer
     }
     private var alive: Bool { lock.lock(); defer { lock.unlock() }; return running }
     private func prepareUSB() {
@@ -41,13 +73,25 @@ final class ConnectRequestServer: @unchecked Sendable {
         if !keep { _ = try? ADB.run(["-s", serial, "reverse", "--remove", "tcp:49372"]) }
     }
     private func acceptLoop(_ fd: Int32) {
-        defer { lock.lock(); listening = -1; lock.unlock(); Darwin.close(fd) }
+        var failure: Int32 = 0
+        defer {
+            lock.lock(); listening = -1; running = false; lock.unlock(); Darwin.close(fd)
+            let error = failure
+            Task { @MainActor [weak self] in self?.retry(error) }
+        }
         while alive {
             var pollValue = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
-            guard poll(&pollValue, 1, 250) > 0, alive else { continue }
+            let polled = poll(&pollValue, 1, 250)
+            if !alive { break }
+            if polled < 0 { if errno == EINTR { continue }; failure = errno; break }
+            if pollValue.revents & Int16(POLLERR | POLLHUP | POLLNVAL) != 0 { failure = ECONNABORTED; break }
+            guard polled > 0 else { continue }
             var peer = sockaddr_in(), length = socklen_t(MemoryLayout<sockaddr_in>.size)
             let accepted = withUnsafeMutablePointer(to: &peer) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { accept(fd, $0, &length) } }
-            guard accepted >= 0 else { continue }
+            guard accepted >= 0 else {
+                if errno == EINTR || errno == EAGAIN { continue }
+                failure = errno; break
+            }
             lock.lock(); client = accepted; let keep = running; lock.unlock()
             guard keep, let key = try? PairStore.load() else { lock.lock(); client = -1; lock.unlock(); Darwin.close(accepted); continue }
             var channel: SecureChannel?
@@ -85,6 +129,7 @@ final class ConnectRequestServer: @unchecked Sendable {
         }
     }
     @MainActor func close() {
+        enabled = false; retryTask?.cancel(); retryTask = nil
         service?.stop(); service = nil; usbTimer?.cancel(); usbTimer = nil
         lock.lock(); running = false
         if client >= 0 { shutdown(client, SHUT_RDWR) }
