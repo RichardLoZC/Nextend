@@ -26,6 +26,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var heading: TextView
     private lateinit var updates: AppUpdates
     private var service: DisplayService? = null
+    private var diagnosticExporting = false
     private var bound = false
     private var started = false
     private var resumed = false
@@ -102,6 +103,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         add(connectionInfo, top = 4)
         connectButton = button(tr("连接", "Connect")) { service?.requestConnection() }; add(connectButton, 48, 10)
         add(button(tr("应用更新", "App updates")) { updates.show() }, 44, 10)
+        add(button(tr("导出诊断日志", "Export diagnostic logs")) { exportDiagnostics() }, 44, 10)
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             add(button(tr("允许后台通知", "Allow background notifications")) {
                 requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
@@ -113,6 +115,28 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
         root.addView(controlContainer, FrameLayout.LayoutParams(dp(504), -2, Gravity.CENTER))
         updateMenuState(); sizeMenu()
+    }
+    private fun exportDiagnostics() {
+        if (diagnosticExporting) return
+        val title = "Nextend-diagnostics-Android-" + java.time.Instant.now().toString().replace(":", "-") + ".zip"
+        runCatching {
+            startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+                .setType("application/zip").putExtra(Intent.EXTRA_TITLE, title), 80)
+        }.onFailure { Toast.makeText(this, tr("无法打开保存位置，请稍后重试。", "Could not open the file picker. Try again."), Toast.LENGTH_LONG).show() }
+    }
+    @Deprecated("Platform Activity callback")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != 80 || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        diagnosticExporting = true
+        val owner = java.lang.ref.WeakReference(this)
+        DiagnosticLog.export(applicationContext, uri) { success ->
+            owner.get()?.takeIf { !it.isDestroyed && !it.isFinishing }?.let { activity ->
+                activity.diagnosticExporting = false
+                Toast.makeText(activity, if (success) tr("诊断日志已保存。", "Diagnostic logs saved.") else tr("日志导出失败，请换一个保存位置后重试。", "Could not export logs. Choose another location and retry."), Toast.LENGTH_LONG).show()
+            }
+        }
     }
     private fun sizeMenu() {
         if (root.width == 0 || root.height == 0) return
@@ -189,14 +213,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
     }
     override fun onStart() {
-        super.onStart(); started = true
+        super.onStart(); started = true; DiagnosticLog.event("viewer.start")
         startForegroundService(Intent(this, DisplayService::class.java))
         bound = bindService(Intent(this, DisplayService::class.java), connection, Context.BIND_AUTO_CREATE)
     }
     override fun onResume() { super.onResume(); resumed = true; updates.resumed(); render() }
     override fun onPause() { resumed = false; touchSurface.disable(); super.onPause() }
     override fun onStop() {
-        started = false
+        started = false; DiagnosticLog.event("viewer.stop")
         updates.pause()
         // onStop can precede surfaceDestroyed; finish native output release while still bound.
         service?.setSurface(this, null, waitForRelease = true)

@@ -23,11 +23,11 @@ Nextend is a native macOS and Android app with a liquid glass interface. It crea
 - Optional FPS overlay based on actual MediaCodec rendered-frame callbacks. Choose its position, color, font and size in **Pad settings** on the Mac. Preferences survive restarts.
 - Chinese and English, switched on the Mac and synchronized to the tablet without reconnecting.
 
-The current versions are **Android 0.8.2 / build 16** and **Mac 0.8.1 / build 13**. Android now checks the signed update feed at linkbio.gz.cn. The Mac download is unchanged and has no in-app updater yet. Both domains remain available during device acceptance. See [migration verification](docs/RELEASE-0.8.2.md). Nextend was previously called PadBridge; internal app identifiers and pairing storage retain that name so upgrades preserve pairing.
+The current versions are **Mac 0.8.5 / build 17** and **Android 0.8.4 / build 18**. This Mac update fixes text-shaped streaks in the cutout menu overlay. The release also includes bounded Wi-Fi interruption recovery, local diagnostic logs with ZIP export, anchored two-finger scrolling, and app pinch zoom. Android reuses the verified 0.8.4 package. See [release notes](docs/RELEASE-0.8.5.md). Internal PadBridge identifiers and pairing storage are retained for upgrades.
 
 ## Requirements and limits
 
-Tested on an M4 MacBook Air (macOS 27.0.1) and Xiaomi Pad 7 Ultra (Android 16). Other hardware has not been validated.
+Tested on an M4 MacBook Air (macOS 27.2) and Xiaomi Pad 7 Ultra (Android 16). Other hardware has not been validated.
 
 - Runtime: Apple Silicon Mac, macOS 14+, and Android 11+. HDR additionally requires compatible macOS capture, HEVC Main10 hardware, and an HLG display.
 - USB: Android USB debugging and an authorized Mac. Xiaomi devices may also require enabling USB installation.
@@ -61,9 +61,11 @@ Touch requires **System Settings → Privacy & Security → Accessibility → Ne
 | Gesture | Direct touch | Trackpad |
 |---|---|---|
 | One finger | Tap, double-tap, drag on the extended display | Move the Mac pointer; tap / double-tap to click; tap, then touch again and move to drag |
-| Two fingers | Tap for right-click; slide to scroll | Tap for right-click; slide to scroll; pinch for app zoom |
+| Two fingers | Tap for right-click; slide to scroll; pinch for app zoom | Tap for right-click; slide to scroll; pinch for app zoom |
 | Three fingers | — | Drag with the left mouse button |
 | Four fingers | — | Swipe horizontally for Spaces; up for Mission Control; down for App Exposé |
+
+In direct mode, two-finger contact immediately positions the pointer at the contact midpoint. The pointer stays there during scrolling. Scroll and pinch stay locked until fingers lift. Direct pinch activates and verifies the window under the initial contact before sending app zoom; an unresolved target receives no keyboard shortcut.
 
 Trackpad movement can reach any active Mac display. Pinch maps to Command +/− and four-finger swipes use Control + arrow shortcuts; applications and macOS shortcut settings must support them. Pressure, rotation, native continuous pinch events and all Apple trackpad gestures are not emulated. Scroll direction follows the Mac’s natural-scrolling preference.
 
@@ -86,7 +88,7 @@ bash scripts/install-usb.sh
 python3 ops/publish_release.py --notes-file ops/release-notes.txt
 ```
 
-Extract `outputs/Nextend-0.8.1-macOS-arm64.zip` into a local temporary directory. Quit the installed app, keep a backup, and use Finder to replace `/Applications/Nextend.app` with the extracted app. Do not merge the ZIP into the old bundle. Open the new app from Applications.
+Extract `outputs/Nextend-0.8.5-macOS-arm64.zip` into a local temporary directory. Quit the installed app, keep a backup, and use Finder to replace `/Applications/Nextend.app` with the extracted app. Do not merge the ZIP into the old bundle. Open the new app from Applications.
 
 Quit the installed app before replacing it. Run the app from Applications: launching inside Documents can make VideoToolbox wait for protected-folder access.
 
@@ -130,3 +132,7 @@ See [0.7.1 cutout folding notes](docs/RELEASE-0.7.1.md), [0.7.0 background and c
 Licensed under **GPL-3.0**. See [LICENSE](LICENSE) and [third-party notices](THIRD_PARTY_NOTICES.md). This is an independent project, not an official OpenDisplay distribution. Use the matching Nextend apps together.
 
 Release operations follow the [NAS update guide](docs/NAS-UPDATES.md) and reusable [nas-app-updates skill](skills/nas-app-updates/SKILL.md). See the [0.8.1 recovery validation](docs/RELEASE-0.8.1.md) and [0.8.0 validation record](docs/RELEASE-0.8.0.md).
+
+## Diagnostic logs
+
+From 0.8.3, both clients keep bounded local connection logs. Use “Export diagnostic logs” in the Mac window or the tablet connection screen. See [diagnostics](docs/DIAGNOSTICS.md) and the [0.8.3 validation record](docs/RELEASE-0.8.3.md). Logs are not uploaded automatically.

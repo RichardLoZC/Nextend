@@ -4,7 +4,7 @@
 
 [English](README.md) · [NAS 下载](https://linkbio.gz.cn/wp-content/uploads/apps/nextend/) · [实现结构](docs/ARCHITECTURE.md)
 
-当前版本为 **Android 0.8.2 / build 16、Mac 0.8.1 / build 13**。Android 更新源迁至 linkbio.gz.cn，Mac 安装包保持原字节。新旧域名并行保留，等待 Pad 实机升级验收；见 [迁移验证](docs/RELEASE-0.8.2.md)。原生 Mac / Android 应用支持真正的 HiDPI 拓展桌面、USB / 配对加密无线、HEVC / H.264 硬件编解码和 HLG 10-bit HDR。
+当前版本为 **Mac 0.8.5 / build 17、Android 0.8.4 / build 18**。修复刘海折叠栏背景误采文字产生白线，加入 Wi-Fi 短暂停顿容错、两端本地日志与 ZIP 导出，以及双指滚动固定鼠标和捏合缩放。Mac 本次更新，Pad 沿用已验证的 0.8.4；见 [发布记录](docs/RELEASE-0.8.5.md)。原生应用支持 HiDPI 拓展桌面、USB / 配对加密无线和硬件编解码。
 
 ## 这版改动
 
@@ -17,7 +17,7 @@
 - Pad 等待页可主动允许后台通知，随后能从通知返回或断开；未授权仍可从 Mac 断开。
 
 - Mac 的“开启触屏”开关默认关闭，连接中可切换直接触屏或触控板。触控板模式保留拓展桌面画面。
-- 双指轻点右键、滑动滚动；触控板增加单指轻点后拖动、三指拖动、四指桌面操作和捏合缩放。
+- 双指轻点右键、滑动滚动、捏合缩放，两种输入模式均支持；触控板还支持单指轻点后拖动、三指拖动和四指桌面操作。
 - Pad 菜单取消，FPS 和诊断集中到 Mac“Pad 设置”；Pad 等待页新增“连接”。
 - Mac 关闭窗口后隐藏 Dock 图标，保留状态栏入口和后台连接；重新打开窗口时恢复 Dock 图标。
 - 连接方式统一在 Mac 选择，Pad 自动接受 USB 或已配对的加密无线连接；换网时更新无线监听。
@@ -56,9 +56,11 @@ Mac 右上角按钮切换中英文，并同步到 Pad。“Pad 设置 → 刘海
 | 手势 | 直接触屏 | 触控板 |
 |---|---|---|
 | 单指 | 在拓展屏点按、双击、拖动 | 相对移动 Mac 光标；轻点、双击；轻点后再次按住拖动 |
-| 双指 | 轻点右键，滑动滚动 | 轻点右键，滑动滚动，捏合缩放 |
+| 双指 | 轻点右键，滑动滚动，捏合缩放 | 轻点右键，滑动滚动，捏合缩放 |
 | 三指 | — | 按住鼠标左键拖动 |
 | 四指 | — | 左右切换桌面，上滑窗口总览，下滑 App 窗口 |
+
+直接触屏时，双指落下会把鼠标定位到两指中心；滚动期间鼠标保持在该位置。捏合与滚动在识别后锁定，抬手后才能切换。直接捏合先定位并激活触点所在窗口，无法确认窗口时不发送缩放快捷键。
 
 触控板可移动到 Mac 的所有活动显示器。捏合映射到 Command +/−，四指滑动映射到 Control + 方向键，效果取决于应用和 macOS 快捷键设置。暂不模拟压力、旋转、原生连续缩放，也不声称覆盖 Apple 触控板的全部手势。滚动方向跟随 Mac 的自然滚动偏好。
 
@@ -70,7 +72,7 @@ Mac 右上角按钮切换中英文，并同步到 Pad。“Pad 设置 → 刘海
 
 ## 设备与限制
 
-实际验证设备为 M4 MacBook Air、macOS 27.0.1 与 Xiaomi Pad 7 Ultra、Android 16。运行要求 Apple Silicon、macOS 14+、Android 11+；其他组合尚未实测。
+实际验证设备为 M4 MacBook Air、macOS 27.2 与 Xiaomi Pad 7 Ultra、Android 16。运行要求 Apple Silicon、macOS 14+、Android 11+；其他组合尚未实测。
 
 60 / 90 / 120 fps 是目标档位，不是稳定性能保证，建议先用 USB、60 fps。静态桌面可能减少出帧。HDR 采用 BT.2020 / HLG、HEVC Main10、有限范围、10-bit 4:2:0；不支持 PQ / HDR10、Dolby Vision，尚未测量物理屏幕亮度与色准。没有音频、通用键盘回传和自动重连；Bonjour 仅发现 Mac，不能替代配对认证。
 
@@ -89,7 +91,7 @@ bash scripts/install-usb.sh
 python3 ops/publish_release.py --notes-file ops/release-notes.txt
 ```
 
-将 `outputs/Nextend-0.8.1-macOS-arm64.zip` 解压到本机临时目录。退出已安装的旧 App，保留旧版备份，再用 Finder 将解压后的 `Nextend.app` 替换到 `/Applications/`；不要直接解压合并到旧 `.app`。从应用程序目录打开新版。
+将 `outputs/Nextend-0.8.5-macOS-arm64.zip` 解压到本机临时目录。退出已安装的旧 App，保留旧版备份，再用 Finder 将解压后的 `Nextend.app` 替换到 `/Applications/`；不要直接解压合并到旧 `.app`。从应用程序目录打开新版。
 
 NAS 挂载可能改写执行权限并附带历史目录；请通过已验证的 ZIP 安装，不直接复制挂载中的 `.app`。编译和测试使用本机临时产物，源码与最终包仍在当前项目。
 
@@ -125,3 +127,7 @@ python3 tests/listener_recovery.py
 可复用的[液态玻璃 skill](skills/liquid-glass-interface/SKILL.md)包含原生与网页规范及示例；[协议](docs/PROTOCOL.md)与[架构](docs/ARCHITECTURE.md)说明传输实现。
 
 后续发布使用 [NAS 更新说明](docs/NAS-UPDATES.md) 和 [nas-app-updates skill](skills/nas-app-updates/SKILL.md)。
+
+## 诊断日志
+
+0.8.3 起两端自动保存可导出的本地连接日志。Mac 主窗口底部、Pad 等待连接界面均有“导出诊断日志”入口。操作与隐私范围见 [诊断说明](docs/DIAGNOSTICS.md)，本轮修复和验收见 [0.8.3](docs/RELEASE-0.8.3.md)。

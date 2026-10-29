@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 
 // Private pipes carry display control only. Pairing keys and video never enter
 // this helper. EOF also covers an abrupt parent crash, including SIGKILL.
@@ -166,6 +167,11 @@ private func readDisplayLines(_ handle: FileHandle, line: @escaping (Data) -> Vo
 }
 
 @MainActor enum DisplayHost {
+    nonisolated private static func finish(_ code: Int32) -> Never {
+        Diagnostics.event("display_host.exit", ["status": code])
+        _ = Diagnostics.journal.flush(timeout: 0.3)
+        Darwin.exit(code)
+    }
     private static var display: NativeVirtualDisplay?
     private static var profile = Profile()
     private static var revision = 0
@@ -173,10 +179,11 @@ private func readDisplayLines(_ handle: FileHandle, line: @escaping (Data) -> Vo
         do {
             let data = try JSONSerialization.data(withJSONObject: value)
             try FileHandle.standardOutput.write(contentsOf: data + Data([10]))
-        } catch { exit(1) }
+        } catch { finish(1) }
     }
     private static func emitError(_ error: AppMessage) {
-        guard let data = try? JSONEncoder().encode(error), let encoded = String(data: data, encoding: .utf8) else { exit(1) }
+        Diagnostics.event("display_host.error", ["message": error.text])
+        guard let data = try? JSONEncoder().encode(error), let encoded = String(data: data, encoding: .utf8) else { finish(1) }
         emit(["error": error.text, "localizedError": encoded])
     }
     private static func reportReady() async {
@@ -203,18 +210,18 @@ private func readDisplayLines(_ handle: FileHandle, line: @escaping (Data) -> Vo
         signal(SIGTERM, SIG_DFL); signal(SIGINT, SIG_DFL); signal(SIGPIPE, SIG_IGN)
         let arguments = CommandLine.arguments
         guard arguments.count == 6, let width = Int(arguments[2]), let height = Int(arguments[3]),
-              let fps = Int(arguments[4]), let color = VideoColor(rawValue: arguments[5]) else { exit(2) }
+              let fps = Int(arguments[4]), let color = VideoColor(rawValue: arguments[5]) else { finish(2) }
         profile.width = width; profile.height = height; profile.fps = fps; profile.color = color
         let application = NSApplication.shared; application.setActivationPolicy(.prohibited)
         do {
             try profile.validate(); display = try NativeVirtualDisplay(profile: profile)
             emit(["created": display!.id])
         }
-        catch { emitError(error.appMessage); exit(1) }
+        catch { emitError(error.appMessage); finish(1) }
         readDisplayLines(FileHandle.standardInput, line: { data in
-            guard let message = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { exit(2) }
+            guard let message = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { finish(2) }
             Task { @MainActor in receive(message) }
-        }, ended: { exit(0) })
+        }, ended: { finish(0) })
         Task { await reportReady() }
         application.run()
     }

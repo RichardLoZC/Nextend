@@ -21,7 +21,8 @@ class VideoDecoder(
     private val presented: (Long, Double) -> Unit,
     private val requestKeyframe: () -> Unit,
     private val outputFormat: (Map<String, Int>) -> Unit,
-    private val fail: (String) -> Unit
+    private val fail: (String) -> Unit,
+    private val sessionID: String = java.util.UUID.randomUUID().toString()
 ) : AutoCloseable {
     private val thread = HandlerThread("PadBridge-codec").also { it.start() }
     private val handler = Handler(thread.looper)
@@ -47,6 +48,8 @@ class VideoDecoder(
     val name: String = info.name
     val visible: Boolean get() = !closed && desiredSurface?.isValid == true
 
+    private fun reportFailure(message: String) { DiagnosticLog.event("decoder.error", sessionID, mapOf("message" to message)); fail(message) }
+
     /** A missing Surface suspends decoding, never the authenticated connection. */
     fun setSurface(surface: Surface?) {
         if (closed) return
@@ -54,12 +57,13 @@ class VideoDecoder(
             if (desiredSurface === surface) return
             desiredSurface = surface; targetVersion++
         }
+        DiagnosticLog.event("decoder.surface", sessionID, mapOf("visible" to (surface?.isValid == true)))
         handler.post { if (!closed) applySurface() }
     }
     fun awaitSurfaceRelease() {
         val done = CountDownLatch(1)
         if (handler.post { done.countDown() } && !done.await(1500, TimeUnit.MILLISECONDS)) {
-            fail("Decoder surface release timed out")
+            reportFailure("Decoder surface release timed out")
         }
     }
     private fun discardBufferedFrames() {
@@ -106,9 +110,9 @@ class VideoDecoder(
                         mc.releaseOutputBuffer(index, render)
                         received.remove(info.presentationTimeUs)
                         if (start != null) ack(info.presentationTimeUs, render, (System.nanoTime() - start) / 1e6)
-                    }.onFailure { if (targetVersion == configuredVersion && desiredSurface === configuredSurface) fail("Decoder output failed: ${it.message}") }
+                    }.onFailure { if (targetVersion == configuredVersion && desiredSurface === configuredSurface) reportFailure("Decoder output failed: ${it.message}") }
                 }
-                override fun onError(mc: MediaCodec, error: MediaCodec.CodecException) { if (!closed && mc === codec && targetVersion == configuredVersion && desiredSurface === configuredSurface) fail("Hardware decoder failed: ${error.diagnosticInfo}") }
+                override fun onError(mc: MediaCodec, error: MediaCodec.CodecException) { if (!closed && mc === codec && targetVersion == configuredVersion && desiredSurface === configuredSurface) reportFailure("Hardware decoder failed: ${error.diagnosticInfo}") }
                 override fun onOutputFormatChanged(mc: MediaCodec, format: MediaFormat) {
                     if (closed || mc !== codec) return
                     android.util.Log.i("PadBridge", "decoder-format $format")
@@ -119,7 +123,8 @@ class VideoDecoder(
                         (values[MediaFormat.KEY_COLOR_STANDARD] == MediaFormat.COLOR_STANDARD_BT2020 &&
                          values[MediaFormat.KEY_COLOR_TRANSFER] == MediaFormat.COLOR_TRANSFER_HLG &&
                          values[MediaFormat.KEY_COLOR_RANGE] == MediaFormat.COLOR_RANGE_LIMITED)
-                    if (formatAccepted) outputFormat(values) else fail("HDR decoder color format mismatch; output stopped")
+                    DiagnosticLog.event("decoder.format", sessionID, values)
+                    if (formatAccepted) outputFormat(values) else reportFailure("HDR decoder color format mismatch; output stopped")
                 }
             }, handler)
             mc.setOnFrameRenderedListener({ source, pts, _ ->
@@ -139,7 +144,7 @@ class VideoDecoder(
         } catch (e: Exception) {
             val obsolete = targetVersion != version || desiredSurface !== surface || !surface.isValid
             releaseCodec()
-            if (!obsolete && !closed) fail("Could not prepare video output: ${e.message}")
+            if (!obsolete && !closed) reportFailure("Could not prepare video output: ${e.message}")
         }
     }
     fun submit(frame: VideoFrame) {
@@ -178,7 +183,7 @@ class VideoDecoder(
                 check(received.size <= 6) { "Decoder did not present frames in time" }
                 codec.queueInputBuffer(index, 0, frame.bytes.size, frame.sequence, 0)
                 awaitingKeyframe = false
-            } catch (e: Exception) { fail("Could not submit frame: ${e.message}"); return }
+            } catch (e: Exception) { reportFailure("Could not submit frame: ${e.message}"); return }
         }
     }
     override fun close() { closeWhenReleased {} }

@@ -50,5 +50,30 @@ func touchSelfTest() throws {
     for _ in 0..<2 { _ = gate.accept(try packet("move", gate.epoch), bounds: bounds, cursor: cursor) }
     let up = gate.accept(try packet("up", gate.epoch), bounds: bounds, cursor: cursor)
     try check(up.first?.point == CGPoint(x: 900, y: -868), "burst moves accumulate despite stale system cursor; UP does not jump")
-    print("PASS: touch authorization epochs, release lifecycle, coordinate bounds and malformed input rejection")
+    _ = gate.setEnabled(true)
+    let directOrigin = CGPoint(x: -800.5, y: 33.5)
+    try check(gate.accept(try packet("begin", gate.epoch), bounds: bounds) ==
+              [TouchEffect(kind: .hover, point: directOrigin)], "two-finger direct begin positions without clicking")
+    for phase in ["zoom-in", "zoom-out"] {
+        let expected: TouchEffect.Kind = phase == "zoom-in" ? .zoomIn : .zoomOut
+        try check(gate.accept(try packet(phase, gate.epoch), bounds: bounds) ==
+                  [TouchEffect(kind: expected, point: directOrigin)], "direct pinch supports " + phase)
+        try check(gate.accept(try packet(phase, gate.epoch - 1), bounds: bounds).isEmpty, "stale pinch rejected")
+    }
+    _ = gate.accept(try packet("down", gate.epoch), bounds: bounds)
+    try check(gate.accept(try packet("zoom-in", gate.epoch), bounds: bounds).isEmpty, "pinch cannot fire while dragging")
+    try check(gate.accept(try packet("begin", gate.epoch), bounds: bounds).map { $0.kind } == [.up, .hover], "new direct gesture releases interrupted drag before positioning")
+    for _ in 0..<3 {
+        try check(gate.accept(try packet("scroll", gate.epoch), bounds: bounds).first?.point == directOrigin,
+                  "anchored direct scroll holds pointer steady")
+    }
+    _ = gate.setEnabled(true, trackpad: true)
+    _ = gate.accept(try packet("begin", gate.epoch), bounds: bounds, cursor: cursor)
+    for phase in ["scroll", "zoom-in", "zoom-out"] {
+        try check(gate.accept(try packet(phase, gate.epoch, x: 0.9, y: 0.1), bounds: bounds).first?.point == cursor,
+                  "trackpad " + phase + " preserves the Mac cursor")
+    }
+    _ = gate.setEnabled(false)
+    try check(gate.accept(try packet("zoom-in", gate.epoch), bounds: bounds).isEmpty, "disabled pinch rejected")
+    print("PASS: touch authorization epochs, release lifecycle, coordinate bounds, anchored scroll, pinch and malformed input rejection")
 }

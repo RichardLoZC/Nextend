@@ -50,14 +50,15 @@ class TouchGesture(private val viewport: TouchViewport, private val slop: Float,
     private var previous = origin
     private var initialSpread = 0.0
     private var zoomAnchor = 0.0
-    private var lastZoom = 0L
+    private var lastZoom: Long? = null
     private val starts = mutableMapOf<Int, TouchPoint>()
     fun cancel() {
-        if (held || (trackpad && first != null)) emit(TouchCommand("cancel"))
+        if (held || (first != null && (trackpad || count >= 2))) emit(TouchCommand("cancel"))
         first = null; count = 0; held = false; lifted = false; moved = false; actionKind = ""; starts.clear()
     }
-    private fun send(phase: String, p: Pair<Float, Float>, from: Pair<Float, Float> = p) {
-        viewport.point(p.first, p.second, true)?.let {
+    private fun send(phase: String, p: Pair<Float, Float>, from: Pair<Float, Float> = p,
+                     anchor: Pair<Float, Float> = p) {
+        viewport.point(anchor.first, anchor.second, true)?.let {
             emit(TouchCommand(phase, it.first, it.second,
                 ((p.first - from.first) / viewport.width).coerceIn(-1.0, 1.0),
                 ((p.second - from.second) / viewport.height).coerceIn(-1.0, 1.0)))
@@ -80,14 +81,18 @@ class TouchGesture(private val viewport: TouchViewport, private val slop: Float,
             if (lifted) return
             points.forEach { starts.putIfAbsent(it.id, it) }
             count = points.size; origin = centroid(points); previous = origin; actionKind = ""
-            initialSpread = spread(points); zoomAnchor = initialSpread
+            initialSpread = spread(points)
+            // Keep the scale baseline usable even if the two contacts overlap.
+            zoomAnchor = initialSpread.coerceAtLeast((slop * 2).toDouble().coerceAtLeast(1.0))
+            lastZoom = null
+            // Direct scrolling targets the two-finger contact area immediately.
+            // Trackpad mode retains the existing Mac cursor from its first DOWN.
+            if (!trackpad && count == 2) send("begin", origin)
             return
         }
-        if (action == Action.POINTER_UP) {
-            if (held) { send("up", previous); held = false }
-            lifted = true; return
-        }
-        if (!lifted && (action == Action.MOVE || action == Action.UP)) {
+        // POINTER_UP still includes the lifting contact's final coordinates.
+        // Evaluate them before locking the remaining fingers out.
+        if (!lifted && (action == Action.MOVE || action == Action.UP || action == Action.POINTER_UP)) {
             val center = if (count == 1) {
                 val p = points.firstOrNull { it.id == firstPoint.id } ?: run { cancel(); return }
                 p.x to p.y
@@ -106,20 +111,24 @@ class TouchGesture(private val viewport: TouchViewport, private val slop: Float,
                 count == 2 && points.size == 2 -> {
                     val span = spread(points)
                     if (actionKind.isEmpty()) {
-                        if (trackpad && abs(span - initialSpread) > slop * 2 && abs(span - initialSpread) > distance * 1.5) actionKind = "zoom"
+                        // Lock one interpretation until all contacts lift. Span
+                        // changes must dominate translation to start a pinch.
+                        if (abs(span - initialSpread) > slop * 2 && abs(span - initialSpread) > distance * 1.5) actionKind = "zoom"
                         else if (distance > slop) actionKind = "scroll"
                     }
-                    if (actionKind == "scroll") send("scroll", center, previous)
-                    if (actionKind == "zoom" && zoomAnchor > 0 && time - lastZoom >= 120) {
+                    // Position and displacement are independent: the pointer
+                    // stays at origin while only wheel deltas follow the fingers.
+                    if (actionKind == "scroll" && (action != Action.POINTER_UP || center != previous)) send("scroll", center, previous, anchor = origin)
+                    if (actionKind == "zoom" && (lastZoom == null || time - lastZoom!! >= 120)) {
                         if (span / zoomAnchor > 1.12 || span / zoomAnchor < 0.89) {
-                            send(if (span > zoomAnchor) "zoom-in" else "zoom-out", center)
+                            send(if (span > zoomAnchor) "zoom-in" else "zoom-out", origin)
                             zoomAnchor = span; lastZoom = time; moved = true
                         }
                     }
                 }
                 count == 3 && trackpad && points.size == 3 -> {
                     if (!held && distance > slop * 2) { send("down", origin); held = true }
-                    if (held) send("move", center, previous)
+                    if (held && (action != Action.POINTER_UP || center != previous)) send("move", center, previous)
                 }
                 count == 4 && trackpad && points.size == 4 && actionKind.isEmpty() && distance > slop * 8 -> {
                     val dx = center.first - origin.first; val dy = center.second - origin.second
@@ -130,13 +139,17 @@ class TouchGesture(private val viewport: TouchViewport, private val slop: Float,
             }
             previous = center
         }
+        if (action == Action.POINTER_UP) {
+            if (held) { send("up", previous); held = false }
+            lifted = true; return
+        }
         if (action == Action.UP) {
             if (held) { send("up", previous); held = false }
             else if (!moved && actionKind.isEmpty() && time - started <= 500) {
                 if (count == 1) { send("click", origin); completedTap(firstPoint, time) }
                 if (count == 2) send("rightclick", origin)
             }
-            if (trackpad) send("end", previous)
+            if (trackpad || count >= 2) send("end", previous)
             first = null; cancel()
         }
     }

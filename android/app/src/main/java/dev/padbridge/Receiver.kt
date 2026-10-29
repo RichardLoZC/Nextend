@@ -61,7 +61,7 @@ class Receiver(
                 if (!claimed) { client.close(); continue }
                 handle(client)
             }
-        } catch (e: Exception) { if (running) android.util.Log.w("PadBridge", "Listener unavailable", e) }
+        } catch (e: Exception) { if (running) { DiagnosticLog.event("listener.failed", details = mapOf("transport" to if (address == "127.0.0.1") "usb" else "wifi", "exception" to e.javaClass.simpleName, "message" to e.message)); android.util.Log.w("PadBridge", "Listener unavailable", e) } }
         finally { runCatching { server?.close() }; if (running) listening(false) }
     }
     /** Takes ownership only on success; no second transport may replace an active socket. */
@@ -77,6 +77,7 @@ class Receiver(
         var releaseDelegated = false
         var ended = UiText("连接已结束", "Disconnected")
         val failure = AtomicReference<UiText?>(null)
+        val diagnosticID = AtomicReference(java.util.UUID.randomUUID().toString())
         try {
             client.use {
                 // Never let an unauthenticated socket acquire the shared Surface.
@@ -84,6 +85,7 @@ class Receiver(
                 require(java.security.MessageDigest.isEqual(pairedKey, key())) { "Pairing changed" }
                 val secure = SecureChannel(it, pairedKey)
                 require(java.security.MessageDigest.isEqual(pairedKey, key())) { "Pairing changed" }
+                DiagnosticLog.event("session.authenticated", diagnosticID.get(), mapOf("transport" to if (address == "127.0.0.1") "usb" else "wifi"))
                 if (!running) return@use
                 ownsSession = lease.acquire(client)
                 if (!ownsSession) {
@@ -93,12 +95,13 @@ class Receiver(
                 if (running) {
                     require(java.security.MessageDigest.isEqual(pairedKey, key())) { "Pairing changed" }
                     releaseDelegated = true
-                    serve(secure, failure) { lease.release(client) }
+                    serve(secure, failure, diagnosticID) { lease.release(client) }
                 }
             }
         } catch (e: Exception) {
             ended = failure.get() ?: UiText("连接结束：${e.message}。请重试连接。", "Connection ended: ${e.message}. Try connecting again.")
         } finally {
+            DiagnosticLog.event("session.end", diagnosticID.get(), mapOf("reason" to ended.text, "ownedSession" to ownsSession, "decoderFailure" to (failure.get() != null)))
             // serve() closes its decoder before another transport can enter.
             if (ownsSession) {
                 if (!releaseDelegated) lease.release(client)
@@ -107,7 +110,7 @@ class Receiver(
             synchronized(lifecycleLock) { if (socket === client) socket = null }
         }
     }
-    private fun serve(channel: SecureChannel, failure: AtomicReference<UiText?>, releaseSession: () -> Unit) {
+    private fun serve(channel: SecureChannel, failure: AtomicReference<UiText?>, diagnosticID: AtomicReference<String>, releaseSession: () -> Unit) {
         var decoder: VideoDecoder? = null
         var touch: TouchSender? = null
         val scheduler = Executors.newSingleThreadScheduledExecutor()
@@ -115,6 +118,7 @@ class Receiver(
         val renderDelayBits = AtomicLong(0)
         val actualFormat = AtomicReference<Map<String, Int>>(emptyMap())
         var color = VideoColor.SDR
+        var lastDiagnosticNS = 0L
         var lastRendered = 0L; var lastDecoded = 0L; var lastTime = System.nanoTime()
         fun send(value: JSONObject) { channel.send(byteArrayOf(1) + value.toString().toByteArray()) }
         try {
@@ -141,6 +145,9 @@ class Receiver(
             require(configured.firstOrNull() == 1.toByte() && configured.size <= 65536)
             val config = JSONObject(String(configured, 1, configured.size - 1))
             require(config.getString("type") == "config" && config.getInt("version") == 1)
+            val sharedID = config.optString("diagnosticSession", "")
+            if (sharedID.matches(Regex("[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}"))) diagnosticID.set(sharedID)
+            DiagnosticLog.event("session.configured", diagnosticID.get(), mapOf("width" to width, "height" to height, "fps" to fps, "codec" to config.optString("codec"), "color" to config.optString("color")))
             require(config.getInt("width") == width && config.getInt("height") == height && config.getInt("fps") == fps)
             val encoding = config.getString("codec")
             require((0 until codecs.length()).any { codecs.getString(it) == encoding }) { "Codec not advertised for this configuration" }
@@ -159,7 +166,7 @@ class Receiver(
                 }, presented = { _, delay -> rendered.incrementAndGet(); renderDelayBits.set(java.lang.Double.doubleToRawLongBits(delay)) },
                 requestKeyframe = { runCatching { send(JSONObject().put("type", "keyframe")) }.onFailure { channel.close() } },
                 outputFormat = { values -> actualFormat.set(values) },
-                fail = { message ->
+                sessionID = diagnosticID.get(), fail = { message ->
                     failure.compareAndSet(null, UiText("解码停止：$message。请重试或在 Mac 降低画质。", "Decoder stopped: $message. Retry or lower quality on the Mac."))
                     channel.closeWithError(byteArrayOf(1) + JSONObject().put("type", if (color == VideoColor.HLG) "hdr-error" else "error").put("message", message).toString().toByteArray())
                 })
@@ -187,6 +194,10 @@ class Receiver(
                         .put("videoFormat", JSONObject().put("color", color.wire).put("format", JSONObject(actualFormat.get()))
                             .put("verified", actualFormat.get().isNotEmpty()).put("rendered", count)))
                     stats(RenderStats(rate, decodeRate, refresh(), dropped.get(), thermal()))
+                    if (lastDiagnosticNS == 0L || now - lastDiagnosticNS >= 15_000_000_000L) {
+                        lastDiagnosticNS = now
+                        DiagnosticLog.event("session.metrics", diagnosticID.get(), mapOf("renderFps" to rate, "decodeFps" to decodeRate, "received" to totalReceived.get(), "decoded" to decodedCount, "dropped" to dropped.get(), "viewerVisible" to decoder.visible, "thermal" to thermal()))
+                    }
                 }.onFailure { channel.close() }
             }, 1, 1, TimeUnit.SECONDS)
             while (running) {

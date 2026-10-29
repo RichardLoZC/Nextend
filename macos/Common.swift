@@ -10,7 +10,7 @@ struct BridgeError: LocalizedError {
 }
 
 func monotonicNS() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
-func log(_ message: String) { print("[Nextend] \(message)"); fflush(stdout) }
+func log(_ message: String, persist: Bool = true) { if persist { Diagnostics.event("runtime.message", ["message": message]) }; print("[Nextend] \(message)"); fflush(stdout) }
 
 extension Data {
     mutating func appendBE<T: FixedWidthInteger>(_ value: T) {

@@ -36,15 +36,15 @@ class TouchGestureTest {
         event(TouchGesture.Action.POINTER_UP, 80, p(12, 600f, 500f), p(7, 400f, 500f))
         event(TouchGesture.Action.MOVE, 100, p(12, 800f, 600f))
         event(TouchGesture.Action.UP, 120, p(12, 800f, 600f))
-        assertEquals(1, sent.size); assertEquals("scroll", sent.single().phase)
-        assertEquals(.1, sent.single().dy, .00001); assertEquals(0, menus)
+        assertEquals(listOf("begin", "scroll", "end"), sent.map { it.phase })
+        assertEquals(.1, sent.single { it.phase == "scroll" }.dy, .00001); assertEquals(0, menus)
     }
     @Test fun addingFingersDuringDragReleasesWithoutOpeningMenu() {
         event(TouchGesture.Action.DOWN, 0, p(1)); event(TouchGesture.Action.MOVE, 10, p(1, 450f))
         event(TouchGesture.Action.POINTER_DOWN, 20, p(1, 450f), p(2))
         event(TouchGesture.Action.POINTER_DOWN, 30, p(1, 450f), p(2), p(3))
         event(TouchGesture.Action.UP, 100, p(3))
-        assertEquals("cancel", sent.last().phase); assertEquals(0, menus)
+        assertEquals(listOf("down", "move", "cancel", "begin", "end"), sent.map { it.phase }); assertEquals(0, menus)
     }
     @Test fun surfaceAspectRatioMapsExactlyWithoutInventingLetterboxes() {
         val wide = TouchViewport(1600, 900)
@@ -69,7 +69,8 @@ class TouchGestureTest {
         event(TouchGesture.Action.POINTER_DOWN, 20, p(1), p(2, 600f))
         event(TouchGesture.Action.POINTER_UP, 90, p(1), p(2, 600f))
         event(TouchGesture.Action.UP, 110, p(1))
-        assertEquals(listOf(TouchCommand("rightclick", .5, .4)), sent)
+        assertEquals(listOf("begin", "rightclick", "end"), sent.map { it.phase })
+        assertEquals(TouchCommand("rightclick", .5, .4), sent[1])
     }
     @Test fun trackpadMovesRelativelyWithoutHoldingMouse() {
         val g = TouchGesture(TouchViewport(1000, 1000), 8f, { sent.add(it) }, true)
@@ -107,13 +108,13 @@ class TouchGestureTest {
         g.accept(TouchGesture.Action.CANCEL, (1..3).map { p(it) }, 1, 70)
         assertEquals(listOf("begin", "down", "move", "cancel"), sent.map { it.phase })
     }
-    @Test fun oppositeFingerMotionIsNeverASecondaryTap() {
+    @Test fun oppositeFingerMotionZoomsWithoutASecondaryTap() {
         event(TouchGesture.Action.DOWN, 0, p(1, 400f))
         event(TouchGesture.Action.POINTER_DOWN, 20, p(1, 400f), p(2, 600f))
         event(TouchGesture.Action.MOVE, 40, p(1, 300f), p(2, 700f))
         event(TouchGesture.Action.POINTER_UP, 80, p(1, 300f), p(2, 700f))
         event(TouchGesture.Action.UP, 100, p(1, 300f))
-        assertTrue(sent.isEmpty())
+        assertEquals(listOf("begin", "zoom-in", "end"), sent.map { it.phase })
     }
     @Test fun secondTapCanDragAndReleasesOnCancel() {
         val g = TouchGesture(TouchViewport(1000, 1000), 8f, { sent.add(it) }, true, tapDrag = true)
@@ -144,5 +145,108 @@ class TouchGestureTest {
         history.remember(p(1), 700); history.clear(); assertFalse(history.consume(p(1), 800))
         history.remember(p(1), 900); assertTrue(history.consume(p(2, 410f), 1000))
         assertFalse(history.consume(p(2, 410f), 1100))
+    }
+
+    @Test fun directScrollPositionsImmediatelyAndKeepsItsOriginWhileDeltasAccumulate() {
+        event(TouchGesture.Action.DOWN, 1000, p(1))
+        event(TouchGesture.Action.POINTER_DOWN, 1020, p(1), p(2, 600f))
+        assertEquals(listOf(TouchCommand("begin", .5, .4)), sent)
+        event(TouchGesture.Action.MOVE, 1040, p(1, 450f, 480f), p(2, 650f, 480f))
+        event(TouchGesture.Action.MOVE, 1060, p(2, 670f, 520f), p(1, 470f, 520f))
+        val scrolls = sent.filter { it.phase == "scroll" }
+        assertEquals(2, scrolls.size)
+        assertTrue(scrolls.all { it.x == .5 && it.y == .4 })
+        assertEquals(.07, scrolls.sumOf { it.dx }, .00001)
+        assertEquals(.12, scrolls.sumOf { it.dy }, .00001)
+    }
+    @Test fun directPinchExpandsAndContractsAtTheOriginalContactArea() {
+        event(TouchGesture.Action.DOWN, 0, p(1))
+        event(TouchGesture.Action.POINTER_DOWN, 20, p(1), p(2, 600f))
+        // First pinch works immediately, including within the first 120 ms.
+        event(TouchGesture.Action.MOVE, 40, p(1, 360f), p(2, 640f))
+        event(TouchGesture.Action.MOVE, 60, p(1, 300f), p(2, 700f))
+        event(TouchGesture.Action.MOVE, 180, p(1, 280f), p(2, 720f))
+        event(TouchGesture.Action.MOVE, 320, p(1, 350f), p(2, 650f))
+        event(TouchGesture.Action.POINTER_UP, 340, p(1, 350f), p(2, 650f))
+        event(TouchGesture.Action.MOVE, 360, p(1, 600f))
+        event(TouchGesture.Action.UP, 380, p(1, 600f))
+        assertEquals(listOf("begin", "zoom-in", "zoom-in", "zoom-out", "end"), sent.map { it.phase })
+        assertTrue(sent.filter { it.phase.startsWith("zoom") }.all { it.x == .5 && it.y == .4 })
+    }
+    @Test fun pinchWithCentroidDriftDoesNotStartScrolling() {
+        event(TouchGesture.Action.DOWN, 1000, p(1))
+        event(TouchGesture.Action.POINTER_DOWN, 1020, p(1), p(2, 600f))
+        event(TouchGesture.Action.MOVE, 1040, p(1), p(2, 740f))
+        event(TouchGesture.Action.MOVE, 1180, p(1, 500f, 600f), p(2, 840f, 600f))
+        assertEquals(listOf("begin", "zoom-in"), sent.map { it.phase })
+        assertEquals(TouchCommand("zoom-in", .5, .4), sent[1])
+    }
+    @Test fun scrollRemainsScrollEvenIfFingersLaterSeparate() {
+        event(TouchGesture.Action.DOWN, 1000, p(1))
+        event(TouchGesture.Action.POINTER_DOWN, 1020, p(1), p(2, 600f))
+        event(TouchGesture.Action.MOVE, 1040, p(1, 400f, 450f), p(2, 600f, 450f))
+        event(TouchGesture.Action.MOVE, 1180, p(1, 300f, 500f), p(2, 800f, 500f))
+        assertEquals(listOf("begin", "scroll", "scroll"), sent.map { it.phase })
+        assertTrue(sent.all { it.x == .5 && it.y == .4 })
+    }
+    @Test fun smallTwoFingerJitterStillRightClicksWithoutScrollingOrZooming() {
+        event(TouchGesture.Action.DOWN, 1000, p(1))
+        event(TouchGesture.Action.POINTER_DOWN, 1020, p(1), p(2, 600f))
+        event(TouchGesture.Action.MOVE, 1040, p(1, 402f, 401f), p(2, 598f, 401f))
+        event(TouchGesture.Action.POINTER_UP, 1060, p(1, 402f, 401f), p(2, 598f, 401f))
+        event(TouchGesture.Action.UP, 1080, p(1, 402f, 401f))
+        assertEquals(listOf("begin", "rightclick", "end"), sent.map { it.phase })
+    }
+    @Test fun cancelResetsTheScrollAnchorForTheNextGesture() {
+        event(TouchGesture.Action.DOWN, 1000, p(1))
+        event(TouchGesture.Action.POINTER_DOWN, 1020, p(1), p(2, 600f))
+        event(TouchGesture.Action.MOVE, 1040, p(1, 400f, 500f), p(2, 600f, 500f))
+        event(TouchGesture.Action.CANCEL, 1060, p(1), p(2, 600f))
+        event(TouchGesture.Action.DOWN, 1080, p(3, 100f, 200f))
+        event(TouchGesture.Action.POINTER_DOWN, 1100, p(3, 100f, 200f), p(4, 300f, 200f))
+        event(TouchGesture.Action.MOVE, 1120, p(3, 100f, 300f), p(4, 300f, 300f))
+        assertEquals(listOf("begin", "scroll", "cancel", "begin", "scroll"), sent.map { it.phase })
+        assertEquals(.2, sent.last().x, .00001); assertEquals(.2, sent.last().y, .00001)
+    }
+    @Test fun aNewPinchDoesNotInheritThePreviousGesturesThrottle() {
+        event(TouchGesture.Action.DOWN, 1000, p(1))
+        event(TouchGesture.Action.POINTER_DOWN, 1020, p(1), p(2, 600f))
+        event(TouchGesture.Action.MOVE, 1040, p(1, 350f), p(2, 650f))
+        event(TouchGesture.Action.CANCEL, 1050, p(1), p(2))
+        event(TouchGesture.Action.DOWN, 1060, p(3))
+        event(TouchGesture.Action.POINTER_DOWN, 1070, p(3), p(4, 600f))
+        event(TouchGesture.Action.MOVE, 1080, p(3, 350f), p(4, 650f))
+        assertEquals(2, sent.count { it.phase == "zoom-in" })
+    }
+    @Test fun overlappingContactsStillHaveAUsablePinchBaseline() {
+        event(TouchGesture.Action.DOWN, 1000, p(1))
+        event(TouchGesture.Action.POINTER_DOWN, 1020, p(1), p(2))
+        event(TouchGesture.Action.MOVE, 1040, p(1, 370f), p(2, 430f))
+        assertEquals(listOf("begin", "zoom-in"), sent.map { it.phase })
+    }
+    @Test fun trackpadPinchUsesTheSameClassifierWithoutAnExtraBegin() {
+        val g = TouchGesture(TouchViewport(1000, 1000), 8f, { sent.add(it) }, true)
+        g.accept(TouchGesture.Action.DOWN, listOf(p(1)), 1, 1000)
+        g.accept(TouchGesture.Action.POINTER_DOWN, listOf(p(1), p(2, 600f)), 2, 1020)
+        g.accept(TouchGesture.Action.MOVE, listOf(p(1, 350f), p(2, 650f)), 1, 1040)
+        g.accept(TouchGesture.Action.POINTER_UP, listOf(p(1, 350f), p(2, 650f)), 2, 1060)
+        g.accept(TouchGesture.Action.UP, listOf(p(1, 350f)), 1, 1080)
+        assertEquals(listOf("begin", "zoom-in", "end"), sent.map { it.phase })
+    }
+
+    @Test fun finalLiftCoordinatesCanCompleteAPinchWithoutAMoveEvent() {
+        event(TouchGesture.Action.DOWN, 1000, p(1))
+        event(TouchGesture.Action.POINTER_DOWN, 1020, p(1), p(2, 600f))
+        event(TouchGesture.Action.POINTER_UP, 1060, p(1, 300f), p(2, 700f))
+        event(TouchGesture.Action.UP, 1080, p(1, 300f))
+        assertEquals(listOf("begin", "zoom-in", "end"), sent.map { it.phase })
+    }
+    @Test fun finalLiftCoordinatesCanCompleteAScrollWithoutARightClick() {
+        event(TouchGesture.Action.DOWN, 1000, p(1))
+        event(TouchGesture.Action.POINTER_DOWN, 1020, p(1), p(2, 600f))
+        event(TouchGesture.Action.POINTER_UP, 1060, p(1, 400f, 500f), p(2, 600f, 500f))
+        event(TouchGesture.Action.UP, 1080, p(1, 400f, 500f))
+        assertEquals(listOf("begin", "scroll", "end"), sent.map { it.phase })
+        assertEquals(TouchCommand("scroll", .5, .4, 0.0, .1), sent[1])
     }
 }

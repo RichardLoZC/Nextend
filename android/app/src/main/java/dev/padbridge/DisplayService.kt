@@ -55,15 +55,15 @@ class DisplayService : Service() {
     private val panel: Display? get() = getSystemService(DisplayManager::class.java).getDisplay(Display.DEFAULT_DISPLAY)
     override fun onBind(intent: Intent): IBinder = binder
     override fun onCreate() {
-        super.onCreate(); Language.load(this)
+        super.onCreate(); Language.load(this); DiagnosticLog.event("service.create")
         settings = getSharedPreferences("settings", MODE_PRIVATE).getString("remote.settings", null)?.let { runCatching { JSONObject(it) }.getOrNull() }
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(NotificationChannel(CHANNEL, tr("拓展屏连接", "Display connection"), NotificationManager.IMPORTANCE_LOW))
         startForeground(NOTIFICATION, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
         val callback = object : ConnectivityManager.NetworkCallback() {
             private fun changed() { handler.post { if (!disposed) refreshWireless() } }
-            override fun onAvailable(network: Network) = changed()
-            override fun onLost(network: Network) = changed()
+            override fun onAvailable(network: Network) { DiagnosticLog.event("network.available"); changed() }
+            override fun onLost(network: Network) { DiagnosticLog.event("network.lost"); changed() }
             override fun onLinkPropertiesChanged(network: Network, properties: LinkProperties) = changed()
         }
         getSystemService(ConnectivityManager::class.java).registerNetworkCallback(
@@ -102,6 +102,7 @@ class DisplayService : Service() {
     private fun changed() { if (!disposed) observer?.invoke() }
     fun requestConnection() {
         if (disposed || requesting || streaming) return
+        DiagnosticLog.event("connection.request")
         // A manual retry also revives listeners whose previous attempts failed.
         if (!receivers.containsKey(false)) { listenerRetries.remove(false); startReceiver(false, "127.0.0.1") }
         refreshWireless()
@@ -140,6 +141,7 @@ class DisplayService : Service() {
         if (disposed) return
         val address = wifiAddress()
         if (wirelessAddress == address && (address == null || receivers.containsKey(true))) return
+        DiagnosticLog.event("network.receiver_refresh", details = mapOf("available" to (address != null), "endpointChanged" to (wirelessAddress != address), "streaming" to streaming))
         receiverTokens.remove(true); retryTokens.remove(true); listening.remove(true)
         reverseReceiver = null; receivers.remove(true)?.close()
         if (activeTransport == true) setStreaming(false)
@@ -149,6 +151,7 @@ class DisplayService : Service() {
         changed()
     }
     private fun setStreaming(active: Boolean, message: UiText? = null) {
+        if (streaming != active || message != null) DiagnosticLog.event("connection.state", details = mapOf("active" to active, "reason" to message?.text))
         streaming = active
         feedback.session(active, message)
         if (!active) { activeTransport = null; touchEndpoint = null; touchMode = TouchMode(false, 0, 0, 0) }
@@ -248,7 +251,7 @@ class DisplayService : Service() {
     private fun updateNotification() { if (!disposed) getSystemService(NotificationManager::class.java).notify(NOTIFICATION, notification()) }
     private fun shutdown() {
         if (disposed) return
-        disposed = true
+        disposed = true; DiagnosticLog.event("service.shutdown", details = mapOf("streaming" to streaming))
         observer?.invoke(); observer = null; uiOwner = null; outputSurface = null
         connectionRequest?.close(); connectionRequest = null
         closeReceivers()

@@ -2,7 +2,7 @@ plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
 android {
     namespace = "dev.padbridge"
     compileSdk = 36
-    defaultConfig { applicationId = "dev.padbridge"; minSdk = 30; targetSdk = 36; versionCode = 16; versionName = "0.8.2" }
+    defaultConfig { applicationId = "dev.padbridge"; minSdk = 30; targetSdk = 36; versionCode = 18; versionName = "0.8.4" }
     // Preserve the installed APK identity. Never silently create a replacement key.
     signingConfigs {
         getByName("debug") {

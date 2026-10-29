@@ -25,6 +25,8 @@ struct SessionOptions {
 // Stop and channel publication are protected by stateLock. Startup is awaited
 // before queue teardown, so encoder/options never change during active use.
 final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+    private let diagnosticID = UUID().uuidString
+    private var lastDiagnosticNS: UInt64 = 0 // pipeline queue only
     private var options: SessionOptions
     private let reverseConnection: ReverseConnectionWaiter?
     private let pairingGeneration = PairStore.generation
@@ -112,9 +114,11 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         self.options = options; self.display = retainedDisplay; self.reverseConnection = reverseConnection
     }
     private var isStopping: Bool { stateLock.lock(); defer { stateLock.unlock() }; return stopping }
-    private func status(_ text: AppMessage, kind: StatusKind = .information) { log(text.text); DispatchQueue.main.async { self.onStatus?(text, kind) } }
+    private func status(_ text: AppMessage, kind: StatusKind = .information) { Diagnostics.event("session.status", session: diagnosticID, ["stage": String(describing: kind), "message": text.text]); log(text.text, persist: false); DispatchQueue.main.async { self.onStatus?(text, kind) } }
 
     @MainActor func launch() {
+        let profile = options.profile
+        Diagnostics.event("session.start", session: diagnosticID, ["transport": options.wireless ? "wifi" : "usb", "width": profile.width, "height": profile.height, "fps": profile.fps, "color": profile.color.rawValue])
         touchRequested = options.touchEnabled; trackpadRequested = options.trackpad; requestedSettings = options.padSettings
         startupTask = Task { await self.start() }
     }
@@ -235,6 +239,8 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
             let supportsTouch = hello["touchVersion"] as? Int == 1
             var config: [String: Any] = ["type": "config", "version": 1, "width": p.width, "height": p.height,
                 "fps": p.fps, "codec": p.codec, "color": p.color.rawValue, "bitDepth": p.color.bitDepth, "input": false]
+            config["diagnosticSession"] = diagnosticID
+            Diagnostics.event("session.negotiated", session: diagnosticID, ["codec": p.codec, "color": p.color.rawValue, "width": p.width, "height": p.height, "fps": p.fps])
             if supportsTouch { config["touchVersion"] = 1 }
             if hello["controlsVersion"] as? Int == 1 { config["controlsVersion"] = 1 }
             let response = try await Task.detached {
@@ -420,6 +426,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
                 let now = monotonicNS()
                 self.touchInput.checkLiveness()
                 if now - self.lastRemoteNS > 6_000_000_000 {
+                    Diagnostics.event("watchdog.control_timeout", session: self.diagnosticID, ["peerSilenceMs": Double(now - self.lastRemoteNS) / 1e6])
                     self.stop(reason: self.writeFailureReason ?? "控制连接超时，已释放虚拟屏。可重新连接。", success: false); return
                 }
                 if !self.ready && now >= startupDeadline {
@@ -527,7 +534,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
             // Keep receiving the peer's final rejection. A writer's EPIPE must
             // not overtake hdr-error. EOF / the existing bounded watchdog ends
             // the session if the peer sends no terminal message.
-            if self.writeFailureReason == nil { self.writeFailureReason = error.appMessage }
+            if self.writeFailureReason == nil { self.writeFailureReason = error.appMessage; Diagnostics.event("transport.write_failed", session: self.diagnosticID, ["message": error.appMessage.text]) }
         }
     }
     private func handle(_ json: [String: Any]) {
@@ -568,6 +575,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
                 if let since = visibleSinceNS { visibleDurationNS += now - since }
                 visibleSinceNS = visible && ready ? now : nil
                 viewerVisible = visible
+                Diagnostics.event("viewer.visibility", session: diagnosticID, ["visible": visible])
                 // A deliberate background pause is not a hardware-encoder stall.
                 encoderRecovery.didEncode()
                 if visible {
@@ -601,7 +609,10 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
             if options.profile.color == .hlg { failHDR(reason) } else { stop(reason: reason, success: false) }
             return
         }
-        if pending.values.contains(where: { now - $0 > 3_000_000_000 }) {
+        // Preserve the existing three-second first-frame HDR rejection/fallback.
+        let tolerantWireless = options.wireless && (options.profile.color != .hlg || verifiedHDR)
+        if pending.values.contains(where: { VideoLinkDeadline.expired(sentAt: $0, now: now, wireless: tolerantWireless) }) {
+            Diagnostics.event("watchdog.video_timeout", session: diagnosticID, ["pending": pending.count, "oldestPendingMs": pending.values.map { Double(now - $0) / 1e6 }.max() ?? 0, "timeoutMs": Double(VideoLinkDeadline.nanoseconds(wireless: tolerantWireless)) / 1e6, "viewerVisible": viewerVisible, "peerSilenceMs": Double(now - lastRemoteNS) / 1e6])
             if options.profile.color == .hlg && !verifiedHDR { failHDR("HDR 解码未在 3 秒内确认首帧"); return }
             stop(reason: "视频链路超时，已释放虚拟屏。可重新连接。", success: false); return
         }
@@ -616,10 +627,14 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         row["color"] = options.profile.color.rawValue; row["hdrVerified"] = verifiedHDR
         row["fallbackReason"] = options.fallbackReason?.text ?? ""
         rows.append(row); if rows.count > 7200 { rows.removeFirst(600) }
+        if lastDiagnosticNS == 0 || now - lastDiagnosticNS >= 15_000_000_000 {
+            lastDiagnosticNS = now
+            Diagnostics.event("session.metrics", session: diagnosticID, ["seconds": elapsed, "encoded": encoded, "decoded": rendered, "pending": pending.count, "encoderDropped": encoderRecovery.dropped, "encodeFps": row["encodeFps"] ?? 0, "renderFps": remote["renderFps"] ?? 0, "ackP95Ms": percentile(pathSamples, 0.95), "peerSilenceMs": Double(now - lastRemoteNS) / 1e6, "viewerVisible": viewerVisible])
+        }
         let metrics = row
         DispatchQueue.main.async { [weak self] in self?.onMetrics?(metrics) }
         lastTickNS = now; lastTickEncoded = encoded; lastTickSource = sourceFrames
-        log(String(format: "编码 %.1f fps · Pad 呈现回调 %.1f fps · 解码往返 P95 %.1f ms · 队列 %d/%d", row["encodeFps"] as? Double ?? 0, remote["renderFps"] as? Double ?? 0, percentile(pathSamples, 0.95), pending.count, maxInFlight))
+        log(String(format: "编码 %.1f fps · Pad 呈现回调 %.1f fps · 解码往返 P95 %.1f ms · 队列 %d/%d", row["encodeFps"] as? Double ?? 0, remote["renderFps"] as? Double ?? 0, percentile(pathSamples, 0.95), pending.count, maxInFlight), persist: false)
         let visibleSeconds = Double(visibleDurationNS + (visibleSinceNS.map { now - $0 } ?? 0)) / 1e9
         if options.profile.color == .hlg && !verifiedHDR && visibleSeconds > 8 { failHDR("8 秒内未收到 Pad HDR 输出确认"); return }
         if options.seconds > 0 && elapsed >= options.seconds {
@@ -641,6 +656,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
         stateLock.lock()
         if stopping { stateLock.unlock(); return }
         stopping = true; stateLock.unlock()
+        Diagnostics.event("session.stop", session: diagnosticID, ["reason": reason.text, "success": success, "fallbackRequested": fallback != nil])
         reverseConnection?.cancel()
         touchInput.close()
         channel?.close()
@@ -703,6 +719,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Send
             let released = self.cleanupRecovery.check()
             let finalReason = released ? reason : (cleanupFailure ?? reason)
             let completed = success && self.ready && released
+            Diagnostics.event("session.cleanup", session: self.diagnosticID, ["released": released, "success": completed, "reason": finalReason.text])
             self.queue.sync { self.writeReport(reason: finalReason, success: completed) }
             log(finalReason.text); self.onStatus?(finalReason, .information)
             self.onFinish?(completed)

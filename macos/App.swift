@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import UniformTypeIdentifiers
 
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var window: NSWindow!
@@ -41,6 +42,7 @@ import ApplicationServices
     private var recoveryTimer: Timer?
     private var listenerMessage: AppMessage?
     private var quitting = false
+    private var exportingDiagnostics = false
     private var signalSources: [DispatchSourceSignal] = []
     private let arguments = CommandLine.arguments
 
@@ -56,11 +58,11 @@ import ApplicationServices
             source.resume(); signalSources.append(source)
         }
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(sleeping), name: NSWorkspace.willSleepNotification, object: nil)
-        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(sleeping), name: NSWorkspace.screensDidSleepNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(displaySleeping), name: NSWorkspace.screensDidSleepNotification, object: nil)
         if arguments.contains("--probe-display") { probe(); return }
         if arguments.contains("--benchmark") || arguments.contains("--connect") || arguments.contains("--capture-test") {
             do { start(try cliOptions(), cli: true) }
-            catch { log(error.localizedDescription); exit(1) }
+            catch { log(error.localizedDescription); _ = Diagnostics.journal.flush(timeout: 0.3); exit(1) }
             return
         }
         makeWindow()
@@ -68,6 +70,7 @@ import ApplicationServices
         statusItem?.button?.image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "Nextend")
         refreshLanguage()
         requestServer = ConnectRequestServer(onStatus: { [weak self] message in
+            Diagnostics.event("listener.status", ["message": message?.text ?? "recovered"])
             self?.listenerMessage = message; self?.renderConnection()
         }) { [weak self] peer, command in
             guard let self, self.checkRecovery(), !self.quitting else { return .rejected }
@@ -185,7 +188,8 @@ import ApplicationServices
         let permission = action("屏幕录制权限", "Screen recording", #selector(permission))
         let arrangement = action("排列显示器", "Arrange displays", #selector(arrangement))
         let pad = action("Pad 设置", "Pad settings", #selector(showPadSettings))
-        let footer = glassStack([permission, arrangement, pad, NSView()], vertical: false, spacing: 10)
+        let diagnostics = action("导出诊断日志", "Export diagnostic logs", #selector(exportDiagnostics))
+        let footer = glassStack([permission, arrangement, pad, diagnostics, NSView()], vertical: false, spacing: 10)
         footer.heightAnchor.constraint(equalToConstant: 38).isActive = true
         let root = fill(glassStack([header, main, footer], spacing: 18))
         root.translatesAutoresizingMaskIntoConstraints = false; background.addSubview(root)
@@ -241,6 +245,9 @@ import ApplicationServices
         for (name, selector) in [(L("桌面采集测试 · 30 秒", "Desktop capture test · 30 s"), #selector(desktopTest)), (L("合成测试 · 30 秒", "Synthetic test · 30 s"), #selector(testPattern))] {
             let test = item(name, selector); test.isEnabled = session == nil && cleanupRecovery == nil; tests.submenu?.addItem(test)
         }
+        tests.submenu?.addItem(.separator())
+        let export = item(L("导出诊断日志…", "Export diagnostic logs…"), #selector(exportDiagnostics)); export.isEnabled = !exportingDiagnostics
+        tests.submenu?.addItem(export)
         menu.addItem(tests)
         menu.addItem(item(L("Pad 设置", "Pad settings"), #selector(showPadSettings)))
         let reset = item(L("重新配对", "Pair again"), #selector(resetPairing)); reset.isEnabled = session != nil; menu.addItem(reset)
@@ -341,11 +348,30 @@ import ApplicationServices
             if let session = self?.session { session.resetPairing() } else { PairStore.revoke() }
         }
     }
-    @objc private func sleeping() { session?.cancel(reason: "Mac 已进入睡眠，虚拟屏已释放；唤醒后点击连接恢复。") }
+    @objc private func displaySleeping() { Diagnostics.event("system.display_sleep", ["sessionActive": session != nil]); session?.cancel(reason: "Mac 已进入睡眠，虚拟屏已释放；唤醒后点击连接恢复。") }
+    @objc private func sleeping() { Diagnostics.event("system.sleep", ["sessionActive": session != nil]); session?.cancel(reason: "Mac 已进入睡眠，虚拟屏已释放；唤醒后点击连接恢复。") }
     @objc private func permission() {
         _ = CGRequestScreenCaptureAccess()
         if !CGPreflightScreenCaptureAccess() { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!) }
         lastMessage = "在系统设置中允许 Nextend 录制屏幕，然后退出并重启本应用。"; renderConnection()
+    }
+    @objc private func exportDiagnostics() {
+        guard !exportingDiagnostics else { return }
+        exportingDiagnostics = true; rebuildMenus()
+        let panel = NSSavePanel(); panel.allowedContentTypes = [.zip]
+        panel.nameFieldStringValue = "Nextend-diagnostics-Mac-" + ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-") + ".zip"
+        panel.message = L("保存连接记录用于排查问题。不包含投屏画面或配对密钥。", "Save connection logs for troubleshooting. No screen images or pairing keys are included.")
+        panel.begin { [weak self] result in
+            guard let self else { return }
+            guard result == .OK, let url = panel.url else { self.exportingDiagnostics = false; self.rebuildMenus(); return }
+            Diagnostics.export(to: url) { [weak self] error in
+                guard let self else { return }
+                self.exportingDiagnostics = false; self.rebuildMenus()
+                if error != nil {
+                    let alert = NSAlert(); alert.messageText = L("日志导出失败，请换一个保存位置后重试。", "Could not export logs. Choose another location and retry."); alert.runModal()
+                } else { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+            }
+        }
     }
     @objc private func arrangement() { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Displays-Settings.extension")!) }
     private func start(_ options: SessionOptions, cli: Bool, retainedDisplay: VirtualDisplay? = nil) {
@@ -395,7 +421,7 @@ import ApplicationServices
             self.connectButton?.isEnabled = true; self.settingControls.forEach { $0.isEnabled = true }
             self.connectionState = .finished(success); self.deviceArt.connected = false; self.metricLabels.forEach { $0.stringValue = "—" }
             self.renderConnection(); self.rebuildMenus()
-            if cli { exit(success ? 0 : 1) } else if self.quitting { NSApp.terminate(nil) }
+            if cli { _ = Diagnostics.journal.flush(timeout: 0.3); exit(success ? 0 : 1) } else if self.quitting { NSApp.terminate(nil) }
         }
         session.onFallback = { [weak self] reason, retainedDisplay in
             guard let self else { return }; self.session = nil; self.endActivity()
@@ -423,6 +449,7 @@ import ApplicationServices
                 } catch { results.append(["requestedHz": fps, "error": error.localizedDescription]) }
             }
             if let data = try? JSONSerialization.data(withJSONObject: results, options: [.prettyPrinted, .sortedKeys]), let text = String(data: data, encoding: .utf8) { print(text) }
+            _ = Diagnostics.journal.flush(timeout: 0.3)
             exit(results.contains { $0["error"] != nil } ? 1 : 0)
         }
     }
@@ -431,7 +458,8 @@ import ApplicationServices
         // Cancel this attempt and terminate after asynchronous display cleanup.
         quitting = true; session.cancel(); return .terminateCancel
     }
-    func applicationWillTerminate(_ notification: Notification) { recoveryTimer?.invalidate(); requestServer?.close() }
+    func applicationWillTerminate(_ notification: Notification) {
+        Diagnostics.event("app.terminate"); _ = Diagnostics.journal.flush(timeout: 0.3);  recoveryTimer?.invalidate(); requestServer?.close() }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag { showWindow() }; return true

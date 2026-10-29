@@ -90,9 +90,11 @@ class SecureChannel(private val socket: Socket, key: ByteArray, private val requ
         var offset = 0
         while (offset < length) {
             val remaining = deadline - System.nanoTime()
-            if (remaining <= 0) throw java.net.SocketTimeoutException("Packet deadline expired")
+            if (remaining <= 0) { DiagnosticLog.event("transport.packet_deadline", details = mapOf("expectedBytes" to length, "receivedBytes" to offset)); throw java.net.SocketTimeoutException("Packet deadline expired") }
             socket.soTimeout = (remaining / 1_000_000L).coerceIn(1, 8000).toInt()
-            val count = input.read(data, offset, length - offset)
+            val count = try { input.read(data, offset, length - offset) } catch (error: java.io.IOException) {
+                DiagnosticLog.event("transport.read_failed", details = mapOf("phase" to if (handshakeDeadlineNS != null) "handshake" else "session", "expectedBytes" to length, "receivedBytes" to offset, "exception" to error.javaClass.simpleName, "message" to error.message)); throw error
+            }
             if (count < 0) throw java.io.EOFException("Mac disconnected")
             offset += count
         }
@@ -104,7 +106,7 @@ class SecureChannel(private val socket: Socket, key: ByteArray, private val requ
         val pending = AtomicBoolean(true)
         // SO_TIMEOUT only bounds reads. Closing from another thread also wakes
         // a blocked writer and every sender waiting on the send monitor.
-        val deadline = watchdog.schedule({ if (pending.compareAndSet(true, false)) close() }, writeTimeoutMillis, TimeUnit.MILLISECONDS)
+        val deadline = watchdog.schedule({ if (pending.compareAndSet(true, false)) { DiagnosticLog.event("transport.write_timeout", details = mapOf("timeoutMs" to writeTimeoutMillis)); close() } }, writeTimeoutMillis, TimeUnit.MILLISECONDS)
         try { output.writeInt(body.size); output.write(body); output.flush() }
         finally { pending.set(false); deadline.cancel(false) }
     }

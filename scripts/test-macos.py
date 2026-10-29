@@ -20,7 +20,8 @@ def main():
         binary = app/'Contents/MacOS/Nextend'
         steps = [('mac-signature', ['codesign', '--verify', '--deep', '--strict', str(app)]),
                  ('mac-self-test', [str(binary), '--self-test']),
-                 ('mac-recovery-test', [str(binary), '--recovery-self-test'])]
+                 ('mac-recovery-test', [str(binary), '--recovery-self-test']),
+                 ('mac-diagnostics-test', [str(binary), '--diagnostics-self-test'])]
         if args.display_lifecycle:
             steps.append(('mac-display-lifecycle', [sys.executable, str(ROOT/'tests/display_lifecycle.py')]))
         env = os.environ.copy(); env['NEXTEND_TEST_APP'] = str(binary)

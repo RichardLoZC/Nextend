@@ -1,8 +1,11 @@
 import AppKit
 import CryptoKit
 
+if !CommandLine.arguments.contains("--self-test") && !CommandLine.arguments.contains("--recovery-self-test") && !CommandLine.arguments.contains("--diagnostics-self-test") && !CommandLine.arguments.contains("--help") { Diagnostics.launch() }
+
 if CommandLine.arguments.contains("--display-host") {
     MainActor.assumeIsolated { DisplayHost.run() }
+    _ = Diagnostics.journal.flush(timeout: 0.3)
     exit(0)
 }
 if CommandLine.arguments.contains("--self-test") {
@@ -15,6 +18,9 @@ if CommandLine.arguments.contains("--recovery-self-test") {
     }
     RunLoop.main.run()
     exit(1)
+}
+if CommandLine.arguments.contains("--diagnostics-self-test") {
+    do { try diagnosticsSelfTest(); exit(0) } catch { print("FAIL: \(error)"); exit(1) }
 }
 if CommandLine.arguments.contains("--help") {
     print("""
@@ -69,6 +75,10 @@ func runSelfTests() throws {
         try check(native.frameCredits == 4, "native resolution preserves latency bound")
         try check(lower.frameCredits <= 6 && lower.frameCredits == (fps == 60 ? 4 : 6), "high-refresh credits respect receiver capacity")
     }
+    try check(!VideoLinkDeadline.expired(sentAt: 1_000_000_000, now: 4_200_000_000, wireless: true), "Wi-Fi retransmission beyond three seconds gets a bounded recovery window")
+    try check(VideoLinkDeadline.expired(sentAt: 1_000_000_000, now: 4_200_000_000, wireless: false), "USB retains its existing bounded timeout")
+    try check(!VideoLinkDeadline.expired(sentAt: 1_000_000_000, now: 9_000_000_000, wireless: true), "Wi-Fi deadline includes the exact boundary")
+    try check(VideoLinkDeadline.expired(sentAt: 1_000_000_000, now: 9_000_000_001, wireless: true), "a stalled Wi-Fi video link still terminates")
     var recovery = EncoderRecovery()
     var replay = CachedFrameReplay()
     replay.request()
@@ -122,6 +132,7 @@ func runSelfTests() throws {
     try check((padSettings.json["safeArea"] as? [String: Any])?["enabled"] as? Bool == false, "cutout folding preserves full-size desktop despite saved margins")
     padSettings.notch.enabled = false; padSettings.notch.guides = true
     try check((padSettings.json["safeArea"] as? [String: Any])?["enabled"] as? Bool == false, "calibration uses the same full-size coordinate space")
+    try menuBarBackgroundSelfTest()
     try HDRConverter.selfTest()
     try touchSelfTest()
     try reverseConnectionSelfTest()

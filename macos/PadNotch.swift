@@ -233,12 +233,12 @@ struct PadNotch: Equatable {
                       PadMenuBarInventory.sameLayout(capturedItems, self.items) else { return }
                 self.imageItems = capturedItems
                 self.image = shot; self.imageBounds = CGRect(x: bounds.minX, y: bounds.minY, width: bounds.width, height: height)
-                // Sample the blank strip immediately before the native extras
-                // bar. Repeating its vertical gradient removes icon silhouettes
-                // without introducing an opaque gray block over the wallpaper.
+                // Crowded menu text can touch the extras bar. Reconstruct a
+                // smooth background instead of stretching a captured glyph.
                 if let first = self.items.map({ $0.frame.minX }).min() {
-                    let x = max(0, min(CGFloat(shot.width) - 4, (first - bounds.minX - 8) * scale))
-                    self.barBackground.background = shot.cropping(to: CGRect(x: x, y: 0, width: 3, height: CGFloat(shot.height)))
+                    let imageScale = CGFloat(shot.width) / bounds.width
+                    self.barBackground.background = MenuBarBackground.make(from: shot,
+                        beforeX: (first - bounds.minX - 8) * imageScale)
                     if let background = self.barBackground.background,
                        let color = NSBitmapImageRep(cgImage: background).colorAt(x: 0, y: background.height / 2)?.usingColorSpace(.sRGB) {
                         let brightness = color.redComponent * 0.2126 + color.greenComponent * 0.7152 + color.blueComponent * 0.0722

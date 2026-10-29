@@ -79,7 +79,10 @@ struct TouchGate {
             relativePoint = point
         }
         switch packet.phase {
-        case .begin: return []
+        case .begin:
+            // A direct two-finger contact positions the pointer without a click
+            // or a synthetic zero-distance wheel event.
+            return release() + [TouchEffect(kind: .hover, point: point)]
         case .end, .cancel: relativePoint = nil; return release()
         case .click, .rightclick:
             guard pressed == nil else { return [] }
@@ -87,16 +90,17 @@ struct TouchGate {
         case .hover:
             guard trackpad, pressed == nil else { return [] }
             return [TouchEffect(kind: .hover, point: point)]
-        case .spaceLeft, .spaceRight, .missionControl, .appWindows, .zoomIn, .zoomOut:
+        case .zoomIn, .zoomOut:
+            guard pressed == nil else { return [] }
+            return [TouchEffect(kind: packet.phase == .zoomIn ? .zoomIn : .zoomOut, point: point)]
+        case .spaceLeft, .spaceRight, .missionControl, .appWindows:
             guard trackpad, pressed == nil else { return [] }
             let kind: TouchEffect.Kind
             switch packet.phase {
             case .spaceLeft: kind = .spaceLeft
             case .spaceRight: kind = .spaceRight
             case .missionControl: kind = .missionControl
-            case .appWindows: kind = .appWindows
-            case .zoomIn: kind = .zoomIn
-            default: kind = .zoomOut
+            default: kind = .appWindows
             }
             return [TouchEffect(kind: kind, point: point)]
         case .down:
@@ -121,6 +125,9 @@ struct TouchGate {
 /// Trackpad actions map only to the fixed shortcuts below.
 final class TouchInputController: @unchecked Sendable {
     private let lock = NSLock()
+    private let zoomWorker = DispatchQueue(label: "Nextend.touch-zoom", qos: .userInteractive)
+    private let zoomSlots = DispatchSemaphore(value: 4)
+    private var zoomGeneration = 0
     private var gate = TouchGate()
     private var displayID: CGDirectDisplayID?
     private let source = CGEventSource(stateID: .privateState)
@@ -134,12 +141,14 @@ final class TouchInputController: @unchecked Sendable {
     }
     func setEnabled(_ value: Bool, trackpad: Bool = false) -> [String: Any] {
         lock.lock(); defer { lock.unlock() }
+        zoomGeneration += 1
         post(gate.setEnabled(value && displayID != nil && AXIsProcessTrusted(), trackpad: trackpad))
         lastClick = nil; clickCount = 0
         return ["type": "touch-mode", "epoch": gate.epoch, "enabled": gate.enabled, "mode": trackpad ? "trackpad" : "direct"]
     }
     func close() {
         lock.lock(); defer { lock.unlock() }
+        zoomGeneration += 1
         post(gate.setEnabled(false)); displayID = nil
     }
     func receive(_ json: [String: Any]) throws {
@@ -154,6 +163,9 @@ final class TouchInputController: @unchecked Sendable {
             post(gate.setEnabled(false)); throw BridgeError("触屏权限或拓展屏已不可用。")
         }
         lastPacketTime = now
+        if [.begin, .cancel, .click, .rightclick, .down, .move, .scroll].contains(packet.phase) {
+            zoomGeneration += 1
+        }
         var ids = [CGDirectDisplayID](repeating: 0, count: 32); var count: UInt32 = 0
         CGGetActiveDisplayList(32, &ids, &count)
         let screens = ids.prefix(Int(count)).map { CGDisplayBounds($0) }.filter { !$0.isNull && $0.width >= 1 && $0.height >= 1 }
@@ -163,6 +175,43 @@ final class TouchInputController: @unchecked Sendable {
     func checkLiveness() {
         lock.lock(); defer { lock.unlock() }
         if gate.pressed != nil && ProcessInfo.processInfo.systemUptime - lastPacketTime > 2 { post(gate.release()) }
+    }
+    /// Keep AX hit testing/activation away from the video ACK queue. Each job
+    /// is bounded, expires quickly and rechecks local authorization before any
+    /// focus change or key event; new/cancelled gestures revoke pending work.
+    private func directZoom(_ effect: TouchEffect) {
+        guard let id = displayID, zoomSlots.wait(timeout: .now()) == .success else { return }
+        let epoch = gate.epoch, generation = zoomGeneration
+        let created = ProcessInfo.processInfo.systemUptime
+        zoomWorker.async { [weak self] in
+            guard let self else { return }
+            defer { self.zoomSlots.signal() }
+            func authorized() -> Bool {
+                self.gate.enabled && !self.gate.trackpad && self.gate.pressed == nil && self.gate.epoch == epoch &&
+                self.zoomGeneration == generation && self.displayID == id &&
+                ProcessInfo.processInfo.systemUptime - created < 0.5 &&
+                AXIsProcessTrusted() && CGDisplayIsActive(id) != 0 && CGDisplayIsInMirrorSet(id) == 0 &&
+                CGDisplayBounds(id).contains(effect.point)
+            }
+            self.lock.lock(); let permitted = authorized(); self.lock.unlock()
+            guard permitted else { return }
+            guard let target = TouchZoomTarget.resolve(at: effect.point) else {
+                Diagnostics.event("input.zoom_target_unavailable"); return
+            }
+            let alreadyFocused = target.isFocused()
+            self.lock.lock()
+            let focused = authorized() && (alreadyFocused || target.requestFocus())
+            self.lock.unlock()
+            guard focused, target.waitForFocus() else { Diagnostics.event("input.zoom_focus_unavailable"); return }
+            let ready = target.isFocused()
+            self.lock.lock(); defer { self.lock.unlock() }
+            guard authorized(), ready, target.application.isActive else { return }
+            for down in [true, false] {
+                let event = CGEvent(keyboardEventSource: self.source, virtualKey: effect.kind == .zoomIn ? 24 : 27, keyDown: down)
+                event?.flags = .maskCommand
+                event?.postToPid(target.application.processIdentifier)
+            }
+        }
     }
     private func post(_ effects: [TouchEffect]) {
         func mouse(_ type: CGEventType, _ point: CGPoint, clicks: Int64 = 1, button: CGMouseButton = .left) {
@@ -185,8 +234,9 @@ final class TouchInputController: @unchecked Sendable {
             case .spaceRight: shortcut(124, flags: .maskControl)
             case .missionControl: shortcut(126, flags: .maskControl)
             case .appWindows: shortcut(125, flags: .maskControl)
-            case .zoomIn: shortcut(24, flags: .maskCommand)
-            case .zoomOut: shortcut(27, flags: .maskCommand)
+            case .zoomIn, .zoomOut:
+                if gate.trackpad { shortcut(effect.kind == .zoomIn ? 24 : 27, flags: .maskCommand) }
+                else { directZoom(effect) }
             case .move: mouse(.leftMouseDragged, effect.point)
             case .up: mouse(.leftMouseUp, effect.point)
             case .click:
